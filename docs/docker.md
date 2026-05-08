@@ -9,6 +9,7 @@ This is the comprehensive Docker reference. For a 5-minute quickstart, see the [
 | **Single-container** (recommended) | You just want chat working. WebUI runs the agent in-process. | `docker-compose.yml` |
 | **Two-container** | You want isolation between gateway (CLI/Telegram/cron) and chat UI. | `docker-compose.two-container.yml` |
 | **Three-container** | Two-container PLUS the dashboard for monitoring. | `docker-compose.three-container.yml` |
+| **Existing Hermes Agent + WebUI** | You already run Hermes Agent and want this repo's WebUI as a separate container without replacing the current dashboard or gateway. | `docker-compose.existing-agent.yml` |
 | **All-in-one image** (community fork — third-party, not maintained by us) | Podman 3.4 / multi-arch / supervisord-style preference. | [sunnysktsang/hermes-suite](https://github.com/sunnysktsang/hermes-suite) — see [#1399](https://github.com/nesquena/hermes-webui/issues/1399) for the original discussion |
 
 If something stops working, **start with the single-container setup** — it's the simplest path and fixes most permission/UID/path-mismatch issues by construction.
@@ -150,6 +151,58 @@ The two- and three-container setups use **named Docker volumes** (not bind mount
 
 The WebUI container doesn't ship with the agent's Python deps — at startup it runs `uv pip install /home/hermeswebui/.hermes/hermes-agent` to install them from the shared volume.
 
+## Attach this repo's WebUI to an existing Hermes Agent stack
+
+If you already have Hermes Agent and the Hermes dashboard running elsewhere and only want this repo's WebUI, use [`docker-compose.existing-agent.yml`](../docker-compose.existing-agent.yml).
+
+This workflow starts a **new WebUI container only**. It does **not** replace:
+
+- an existing dashboard on host port `9119`
+- an existing gateway container or its current host-port mapping
+
+Instead, it reuses two things from the live agent setup:
+
+- the existing Hermes home directory (`HERMES_HOME`) as the WebUI's `/home/hermeswebui/.hermes`
+- the existing `hermes-agent` source checkout mounted read-only at `/opt/hermes`
+
+For workspace compatibility, this attach compose mounts the same host workspace at both `/workspace` and `/opt/data/workspace`. The second path matches the common `terminal.cwd` already stored in many existing Hermes configs, so command-agent shell tools keep working without editing the shared `config.yaml`.
+
+Operator note: shared Hermes config/model/provider state and WebUI chat history are different state surfaces. A successful attach should reflect the mounted `HERMES_HOME` configuration quickly, but a newly attached WebUI can still show an empty conversation list because WebUI session history lives under the WebUI state directory (`.../webui/`) and is not the same thing as the agent gateway or dashboard runtime state.
+
+Run it like this:
+
+```bash
+docker compose -f docker-compose.existing-agent.yml up -d
+```
+
+This attach workflow supports a **read-only mounted** `hermes-agent` checkout, including common Windows + Docker Desktop setups. The WebUI stages a temporary writable copy for dependency installation at container startup, so you do not need to make the host checkout writable inside the container.
+
+The existing-agent attach compose also sets `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES=reportlab`, so PDF generation libraries stay available to command-agent shell sessions after container recreates. If you need more shell-visible Python packages in this workflow, extend that env var with a whitespace-separated list.
+
+This compose file pulls the upstream GHCR WebUI image by default (`ghcr.io/nesquena/hermes-webui:latest`), so `docker compose pull` can pick up published WebUI updates without rebuilding locally. Standardize this attach workflow on the upstream `latest` tag rather than a fork-specific image unless you intentionally need fork-only behavior.
+
+Defaults assume a sibling checkout layout:
+
+- `../hermes-agent` for the agent source tree
+- `../hermes-agent/data` for the existing `HERMES_HOME`
+
+Optional overrides:
+
+- `HERMES_AGENT_REPO` — host path to the existing `hermes-agent` checkout
+- `HERMES_AGENT_HOST_HOME` — host path to the existing Hermes home directory
+- `HERMES_WORKSPACE` — host path mounted at both `/workspace` and `/opt/data/workspace`
+- `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES` — whitespace-separated Python packages installed into the command-agent shell environment on container start
+- `HERMES_WEBUI_HOST_PORT` — host port for the new WebUI container; changes the host mapping only
+- `HERMES_WEBUI_BIND_HOST` — bind address for the new WebUI container (default `127.0.0.1`)
+
+The container-internal WebUI port remains `8787`. If `8787` is busy on your host, remap the host side only, for example:
+
+```bash
+HERMES_WEBUI_HOST_PORT=8790 docker compose -f docker-compose.existing-agent.yml up -d
+```
+
+This attach workflow still inherits the normal two-container limitation: agent processes started from the WebUI run in the **WebUI container**, not in the existing gateway container. If you need extra tools inside chat, install them in the WebUI image.
+
 ## Bind-mount migration (advanced)
 
 If you really need to bind-mount an existing host `~/.hermes` (e.g. you're keeping config in dotfiles, sharing with a non-Docker `hermes` install, etc.):
@@ -181,6 +234,7 @@ volumes:
 - [`docker-compose.yml`](../docker-compose.yml) — single container (recommended)
 - [`docker-compose.two-container.yml`](../docker-compose.two-container.yml) — agent + webui
 - [`docker-compose.three-container.yml`](../docker-compose.three-container.yml) — agent + dashboard + webui
+- [`docker-compose.existing-agent.yml`](../docker-compose.existing-agent.yml) — webui only, attached to an existing Hermes Agent setup
 - [`.env.docker.example`](../.env.docker.example) — environment variable template
 - [`Dockerfile`](../Dockerfile) — single-container build
 - [`docker_init.bash`](../docker_init.bash) — container entrypoint script

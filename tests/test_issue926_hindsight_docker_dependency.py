@@ -30,3 +30,22 @@ def test_926_hindsight_install_runs_after_fast_restart_guard():
 def test_926_hindsight_dependency_stays_docker_specific():
     """Local non-Docker bootstrap should not install optional memory clients."""
     assert "hindsight-client" not in REQUIREMENTS_TXT
+
+
+def test_extra_shell_python_packages_hook_exists_for_docker_attach_workflows():
+    """Docker init must support persistent shell-visible Python packages via env."""
+    assert "HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES" in INIT_SH
+    assert '"$SYSTEM_PYTHON" -m pip install --user' in INIT_SH
+
+
+def test_extra_shell_python_packages_run_after_fast_restart_guard():
+    """Existing Docker venvs must still self-heal extra shell packages on restart."""
+    deps_guard_pos = INIT_SH.find("if [ -f /app/venv/.deps_installed ]; then")
+    assert deps_guard_pos != -1, ".deps_installed fast-restart guard not found"
+
+    expected_sequence = "\nensure_hindsight_client_docker_dependency\nensure_extra_shell_python_packages\n"
+    call_after_guard_pos = INIT_SH.find(expected_sequence, deps_guard_pos)
+    assert call_after_guard_pos != -1, (
+        "extra shell Python package install check must run outside the .deps_installed "
+        "guard so recreated attach containers regain requested shell libraries"
+    )

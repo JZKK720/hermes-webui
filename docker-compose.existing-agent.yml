@@ -1,0 +1,54 @@
+# Hermes WebUI attached to an existing Hermes Agent stack
+#
+# QUICK START:
+#   docker compose -f docker-compose.existing-agent.yml up -d
+#   Open http://localhost:8787
+#
+# This starts ONLY a Hermes WebUI container from the upstream GHCR image.
+# It does NOT replace an existing Hermes dashboard on 9119 or an existing
+# Hermes gateway container. Instead, it reuses an existing Hermes home bind
+# mount and an existing hermes-agent source checkout.
+#
+# Default host paths assume a sibling checkout layout:
+#   ../hermes-agent       -> hermes-agent source tree
+#   ../hermes-agent/data  -> existing HERMES_HOME used by the live agent stack
+
+services:
+  hermes-webui:
+    image: ghcr.io/nesquena/hermes-webui:latest
+    container_name: hermes-webui-existing-agent
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - rm -f /tmp/hermeswebui_init.bash && cp /docker_init.override.bash /tmp/hermeswebui_init.bash && sed -i 's/\r$//' /tmp/hermeswebui_init.bash && chmod 555 /tmp/hermeswebui_init.bash && exec /tmp/hermeswebui_init.bash
+    ports:
+      - "${HERMES_WEBUI_BIND_HOST:-127.0.0.1}:${HERMES_WEBUI_HOST_PORT:-8787}:8787"
+    volumes:
+      - ./docker_init.bash:/docker_init.override.bash:ro
+      # Reuse the existing Hermes home directory from the live agent stack.
+      - ${HERMES_AGENT_HOST_HOME:-../hermes-agent/data}:/home/hermeswebui/.hermes
+      # Mount the existing hermes-agent checkout so docker_init.bash can install
+      # the agent package and dependencies into the WebUI virtual environment.
+      - ${HERMES_AGENT_REPO:-../hermes-agent}:/opt/hermes:ro
+      # Workspace shown in the WebUI file browser.
+      - ${HERMES_WORKSPACE:-..}:/workspace
+      # Compatibility mount for existing Hermes configs that still use
+      # terminal.cwd: /opt/data/workspace.
+      - ${HERMES_WORKSPACE:-..}:/opt/data/workspace
+    environment:
+      - WANTED_UID=${UID:-1000}
+      - WANTED_GID=${GID:-1000}
+      - HERMES_WEBUI_HOST=0.0.0.0
+      - HERMES_WEBUI_PORT=8787
+      - HERMES_WEBUI_STATE_DIR=/home/hermeswebui/.hermes/webui
+      # Match the common terminal.cwd path from existing Hermes agent stacks.
+      - HERMES_WEBUI_DEFAULT_WORKSPACE=/opt/data/workspace
+      # Keep PDF generation libraries available to command-agent shells
+      # across container recreates without building a forked image.
+      - HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES=reportlab
+      # Optional: set a password if you expose beyond localhost.
+      # - HERMES_WEBUI_PASSWORD=change-me-to-something-strong
+      # Optional: if the existing Hermes home intentionally keeps .env group-readable.
+      # - HERMES_SKIP_CHMOD=1
+      # - HERMES_HOME_MODE=0640
+    restart: unless-stopped

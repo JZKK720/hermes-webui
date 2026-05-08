@@ -290,6 +290,8 @@ sudo mkdir -p ${UV_CACHE_DIR} || error_exit "Failed to create /uv_cache director
 sudo chown hermeswebui:hermeswebui ${UV_CACHE_DIR} || error_exit "Failed to set owner of ${UV_CACHE_DIR} to hermeswebui user"
 
 cd /app
+SYSTEM_PYTHON=$(command -v python3)
+if [ -z "$SYSTEM_PYTHON" ]; then error_exit "Failed to locate system python3"; fi
 if [ -f /app/venv/bin/python3 ]; then
   echo ""; echo "== Existing virtual environment found — reusing (fast restart)"
 else
@@ -317,6 +319,32 @@ ensure_hindsight_client_docker_dependency() {
   fi
 }
 
+ensure_extra_shell_python_packages() {
+  # Keep this outside the .deps_installed fast-restart guard so an attach
+  # container can persist extra command-agent shell libraries across recreate.
+  if [ -z "${HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES:-}" ]; then
+    return 0
+  fi
+
+  read -r -a _extra_shell_package_args <<< "${HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES}"
+  if [ "${#_extra_shell_package_args[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  _extra_shell_packages_normalized="${_extra_shell_package_args[*]}"
+  _extra_shell_packages_marker="/app/venv/.extra_shell_python_packages_installed"
+
+  echo ""; echo "== Checking extra shell Python packages"
+  if [ -f "$_extra_shell_packages_marker" ] && [ "$(cat "$_extra_shell_packages_marker" 2>/dev/null)" = "$_extra_shell_packages_normalized" ]; then
+    echo "-- Extra shell Python packages already installed — skipping"
+    return 0
+  fi
+
+  echo "-- Installing extra shell Python packages for command-agent shells: $_extra_shell_packages_normalized"
+  "$SYSTEM_PYTHON" -m pip install --user "${_extra_shell_package_args[@]}" --trusted-host pypi.org --trusted-host files.pythonhosted.org || error_exit "Failed to install extra shell Python packages"
+  printf '%s' "$_extra_shell_packages_normalized" > "$_extra_shell_packages_marker"
+}
+
 if [ -f /app/venv/.deps_installed ]; then
   echo ""; echo "== Dependencies already installed — skipping (fast restart)"
 else
@@ -338,7 +366,29 @@ else
     fi
   done
   if [ -n "$_agent_src" ]; then
-    uv pip install "$_agent_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org || error_exit "Failed to install hermes-agent's requirements"
+    _agent_install_src="$_agent_src"
+    _agent_stage_src=""
+    if [ "$_agent_src" = "/opt/hermes" ]; then
+      # The existing-agent attach workflow mounts /opt/hermes read-only.
+      # Building from that source tree writes egg-info into the checkout,
+      # so always stage a writable copy first.
+      _agent_stage_src="1"
+    else
+      _agent_write_test="$_agent_src/.hermeswebui-write-test"
+      if ! ( : > "$_agent_write_test" ) 2>/dev/null; then
+        _agent_stage_src="1"
+      else
+        rm -f "$_agent_write_test"
+      fi
+    fi
+    if [ -n "$_agent_stage_src" ]; then
+      _agent_tmp="/tmp/hermes-agent-install-src"
+      rm -rf "$_agent_tmp"
+      mkdir -p "$_agent_tmp" || error_exit "Failed to create temporary hermes-agent install directory"
+      rsync -a --delete "$_agent_src/" "$_agent_tmp/" || error_exit "Failed to stage hermes-agent source from read-only mount"
+      _agent_install_src="$_agent_tmp"
+    fi
+    uv pip install "$_agent_install_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org || error_exit "Failed to install hermes-agent's requirements"
   else
     echo ""
     echo "!! WARNING: hermes-agent source not found."
@@ -356,6 +406,7 @@ else
 fi
 
 ensure_hindsight_client_docker_dependency
+ensure_extra_shell_python_packages
 
 echo ""; echo "== Running hermes-webui"
 cd /app; python server.py || error_exit "hermes-webui failed or exited with an error"

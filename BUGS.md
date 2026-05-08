@@ -24,6 +24,11 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Existing-agent attach workflow startup and shell-path failures~~ -- Fixed (fork local, 2026-05-08)
+
+- **Was:** The attach workflow could fail to start from the upstream GHCR WebUI image when the mounted Hermes Agent repo was read-only, and command-agent shells could fail with `installation failed because the workspace directory (/opt/data/workspace) could not be found or accessed by the shell environment.` Recreated containers also lost extra shell-only Python dependencies like `reportlab`.
+- **Fix:** The fork attach workflow now stages read-only agent install sources through `/tmp`, mounts `HERMES_WORKSPACE` at both `/workspace` and `/opt/data/workspace` for compatibility with existing Hermes configs, and supports persistent shell-environment package installs via `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES`.
+
 ### ~~Session title truncation / hover actions~~ -- Fixed (Sprint 16)
 
 - **Was:** Action icons reserved ~30px of space even when invisible, truncating titles.
