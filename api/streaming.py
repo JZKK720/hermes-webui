@@ -382,6 +382,9 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
     agent starts, so merge into one dict first and let the active workspace win.
     """
     env = dict(profile_runtime_env or {})
+    current_pythonpath = str(os.environ.get('PYTHONPATH') or '').strip()
+    if current_pythonpath and not str(env.get('PYTHONPATH') or '').strip():
+        env['PYTHONPATH'] = current_pythonpath
     env.update({
         'TERMINAL_CWD': str(workspace),
         'HERMES_EXEC_ASK': '1',
@@ -1820,6 +1823,7 @@ def _run_agent_streaming(
     *,
     ephemeral=False,
     model_provider=None,
+    goal_related=False,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 

@@ -61,6 +61,7 @@ RUN chown -R hermeswebuitoo:hermeswebuitoo /apptoo
 USER root
 
 COPY --chmod=555 docker_init.bash /hermeswebui_init.bash
+RUN sed -i 's/\r$//' /hermeswebui_init.bash
 
 RUN touch /.within_container
 

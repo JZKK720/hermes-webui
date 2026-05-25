@@ -103,14 +103,32 @@ def _discover_agent_dir() -> pathlib.Path:
 def _discover_python(agent_dir) -> str:
     if os.getenv('HERMES_WEBUI_PYTHON'):
         return os.getenv('HERMES_WEBUI_PYTHON')
+    venv_candidates = []
     if agent_dir:
-        venv_py = agent_dir / 'venv' / 'bin' / 'python'
+        venv_candidates.extend([
+            agent_dir / 'venv' / 'Scripts' / 'python.exe',
+            agent_dir / 'venv' / 'bin' / 'python',
+        ])
+    venv_candidates.extend([
+        REPO_ROOT / '.venv' / 'Scripts' / 'python.exe',
+        REPO_ROOT / '.venv' / 'bin' / 'python',
+    ])
+    for venv_py in venv_candidates:
         if venv_py.exists():
             return str(venv_py)
-    local_venv = REPO_ROOT / '.venv' / 'bin' / 'python'
-    if local_venv.exists():
-        return str(local_venv)
-    return shutil.which('python3') or shutil.which('python') or 'python3'
+
+    launchers = ['python3', 'python']
+    if os.name == 'nt':
+        launchers = ['python', 'python3']
+    resolved = [shutil.which(name) for name in launchers]
+    if os.name == 'nt':
+        for candidate in resolved:
+            if candidate and 'WindowsApps' not in candidate:
+                return candidate
+    for candidate in resolved:
+        if candidate:
+            return candidate
+    return 'python' if os.name == 'nt' else 'python3'
 
 HERMES_AGENT = _discover_agent_dir()
 VENV_PYTHON  = _discover_python(HERMES_AGENT)

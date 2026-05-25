@@ -70,7 +70,7 @@ def test_streaming_thread_env_allows_profile_terminal_cwd_override():
         re.DOTALL,
     )
     assert match, "_build_agent_thread_env not found in api/streaming.py"
-    ns: dict = {}
+    ns: dict = {"os": os}
     exec(compile(match.group(1), "<streaming_extract>", "exec"), ns)
 
     env = ns["_build_agent_thread_env"](
@@ -91,3 +91,21 @@ def test_streaming_thread_env_allows_profile_terminal_cwd_override():
     assert env["HERMES_SESSION_KEY"] == "active-session"
     assert env["HERMES_HOME"] == "/active/profile/home"
     assert env["TERMINAL_ENV"] == "ssh"
+
+
+def test_streaming_thread_env_preserves_pythonpath_for_shell_packages(monkeypatch):
+    src = Path("api/streaming.py").read_text(encoding="utf-8")
+
+    match = re.search(
+        r"(def _build_agent_thread_env\(.*?\n)(?=\ndef |\nclass )",
+        src,
+        re.DOTALL,
+    )
+    assert match, "_build_agent_thread_env not found in api/streaming.py"
+    ns: dict = {"os": os}
+    exec(compile(match.group(1), "<streaming_extract>", "exec"), ns)
+
+    monkeypatch.setenv("PYTHONPATH", "/app/venv/shell-python")
+    env = ns["_build_agent_thread_env"]({}, "/active/workspace", "active-session", "/active/profile/home")
+
+    assert env["PYTHONPATH"] == "/app/venv/shell-python"

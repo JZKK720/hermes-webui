@@ -54,6 +54,43 @@ def test_boot_default_itself_is_trusted(monkeypatch, tmp_path):
     assert result == boot_default.resolve()
 
 
+def test_mount_alias_of_boot_default_is_trusted(monkeypatch, tmp_path):
+    """A bind-mount alias of DEFAULT_WORKSPACE must also be trusted.
+
+    The existing-agent Docker attach workflow mounts the same host workspace at
+    both /workspace and /opt/data/workspace. ``Path.resolve()`` preserves those
+    spellings, so emulate the alias by teaching Path.samefile() that the two
+    roots are the same underlying directory.
+    """
+    import api.workspace as ws_mod
+
+    boot_default = tmp_path / "opt" / "data" / "workspace"
+    boot_default.mkdir(parents=True)
+    alias_root = tmp_path / "workspace"
+    alias_root.mkdir(parents=True)
+    sub = alias_root / "myproject"
+    sub.mkdir()
+
+    monkeypatch.setattr(ws_mod, "_BOOT_DEFAULT_WORKSPACE", str(boot_default))
+
+    path_type = type(alias_root)
+    original_samefile = path_type.samefile
+    alias_resolved = alias_root.resolve()
+    boot_resolved = boot_default.resolve()
+
+    def fake_samefile(self, other):
+        self_path = Path(self).resolve()
+        other_path = Path(other).resolve()
+        if {self_path, other_path} == {alias_resolved, boot_resolved}:
+            return True
+        return original_samefile(self, other)
+
+    monkeypatch.setattr(path_type, "samefile", fake_samefile)
+
+    result = resolve_trusted_workspace(str(sub))
+    assert result == sub.resolve()
+
+
 def test_path_outside_boot_default_and_home_is_rejected(monkeypatch, tmp_path):
     """A path that is not under home, not in the saved list, and not under
     DEFAULT_WORKSPACE must still be rejected."""

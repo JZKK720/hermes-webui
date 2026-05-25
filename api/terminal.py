@@ -10,21 +10,39 @@ from __future__ import annotations
 
 import errno
 import codecs
-import fcntl
 import os
 import queue
-import select
 import shutil
 import signal
 import struct
 import subprocess
-import termios
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility shim
+    fcntl = None
+
+try:
+    import select
+except ImportError:  # pragma: no cover - Windows compatibility shim
+    select = None
+
+try:
+    import termios
+except ImportError:  # pragma: no cover - Windows compatibility shim
+    termios = None
+
+
+def _supports_pty() -> bool:
+    return bool(hasattr(os, "openpty") and fcntl is not None and termios is not None and select is not None)
+
 
 def _set_nonblocking(fd: int) -> None:
+    if fcntl is None:
+        return
     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
@@ -40,12 +58,14 @@ class TerminalSession:
     session_id: str
     workspace: str
     proc: subprocess.Popen
-    master_fd: int
+    master_fd: int | None
     rows: int = 24
     cols: int = 80
     output: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2000))
     closed: threading.Event = field(default_factory=threading.Event)
     reader: threading.Thread | None = None
+    stdin_pipe: object | None = None
+    stdout_pipe: object | None = None
 
     def is_alive(self) -> bool:
         return not self.closed.is_set() and self.proc.poll() is None
@@ -75,6 +95,8 @@ def _decode_terminal_output(decoder, data: bytes) -> str:
 
 
 def _shell_path() -> str:
+    if os.name == "nt":
+        return os.environ.get("COMSPEC") or shutil.which("pwsh") or shutil.which("powershell") or shutil.which("cmd") or "cmd.exe"
     shell = os.environ.get("SHELL") or ""
     if shell and Path(shell).exists():
         return shell
@@ -91,6 +113,25 @@ def _shell_argv(shell: str) -> list[str]:
 def _reader_loop(term: TerminalSession) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
+        if term.stdout_pipe is not None:
+            while not term.closed.is_set():
+                try:
+                    reader = getattr(term.stdout_pipe, "read1", None)
+                    if callable(reader):
+                        data = reader(8192)
+                    else:
+                        data = term.stdout_pipe.read(8192)
+                except OSError as exc:
+                    if exc.errno in (errno.EIO, errno.EBADF):
+                        break
+                    raise
+                if not data:
+                    break
+                text = _decode_terminal_output(decoder, data)
+                if text:
+                    term.put_output("output", {"text": text})
+            return
+
         while not term.closed.is_set():
             if term.proc.poll() is not None:
                 break
@@ -122,12 +163,14 @@ def _reader_loop(term: TerminalSession) -> None:
 def _set_size(term: TerminalSession, rows: int, cols: int) -> None:
     term.rows = max(8, min(int(rows or term.rows or 24), 80))
     term.cols = max(20, min(int(cols or term.cols or 80), 240))
+    if term.master_fd is None or fcntl is None or termios is None:
+        return
     try:
         fcntl.ioctl(term.master_fd, termios.TIOCSWINSZ, _winsize(term.rows, term.cols))
     except OSError:
         pass
     try:
-        if term.proc.poll() is None:
+        if term.proc.poll() is None and hasattr(os, "killpg"):
             os.killpg(term.proc.pid, signal.SIGWINCH)
     except (OSError, ProcessLookupError):
         pass
@@ -150,13 +193,12 @@ def start_terminal(session_id: str, workspace: Path, rows: int = 24, cols: int =
         if current:
             close_terminal(sid)
 
-        master_fd, slave_fd = os.openpty()
         # Build a safe env: allowlist common shell vars, strip API keys and secrets.
         # The PTY shell is an interactive UI surface — do not leak server credentials.
         _SAFE_ENV_KEYS = {
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL",
             "LC_CTYPE", "LC_MESSAGES", "LANGUAGE", "TZ", "TMPDIR", "TEMP",
-            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PYTHONPATH",
         }
         env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
         env.update(
@@ -170,18 +212,37 @@ def start_terminal(session_id: str, workspace: Path, rows: int = 24, cols: int =
             }
         )
         shell = _shell_path()
-        proc = subprocess.Popen(
-            _shell_argv(shell),
-            cwd=cwd,
-            env=env,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            close_fds=True,
-            start_new_session=True,
-        )
-        os.close(slave_fd)
-        _set_nonblocking(master_fd)
+        stdin_pipe = None
+        stdout_pipe = None
+        if _supports_pty():
+            master_fd, slave_fd = os.openpty()
+            proc = subprocess.Popen(
+                _shell_argv(shell),
+                cwd=cwd,
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+            )
+            os.close(slave_fd)
+            _set_nonblocking(master_fd)
+        else:
+            master_fd = None
+            proc = subprocess.Popen(
+                _shell_argv(shell),
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            stdin_pipe = proc.stdin
+            stdout_pipe = proc.stdout
 
         term = TerminalSession(
             session_id=sid,
@@ -190,6 +251,8 @@ def start_terminal(session_id: str, workspace: Path, rows: int = 24, cols: int =
             master_fd=master_fd,
             rows=rows,
             cols=cols,
+            stdin_pipe=stdin_pipe,
+            stdout_pipe=stdout_pipe,
         )
         _set_size(term, rows, cols)
         term.reader = threading.Thread(target=_reader_loop, args=(term,), daemon=True)
@@ -210,7 +273,14 @@ def write_terminal(session_id: str, data: str) -> None:
     term = get_terminal(session_id)
     if not term or not term.is_alive():
         raise KeyError("terminal not running")
-    os.write(term.master_fd, str(data or "").encode("utf-8", errors="replace"))
+    payload = str(data or "").encode("utf-8", errors="replace")
+    if term.master_fd is not None:
+        os.write(term.master_fd, payload)
+        return
+    if term.stdin_pipe is None:
+        raise KeyError("terminal not running")
+    term.stdin_pipe.write(payload)
+    term.stdin_pipe.flush()
 
 
 def resize_terminal(session_id: str, rows: int, cols: int) -> None:
@@ -229,20 +299,37 @@ def close_terminal(session_id: str) -> bool:
     term.closed.set()
     try:
         if term.proc.poll() is None:
-            try:
-                os.killpg(term.proc.pid, signal.SIGHUP)
-            except ProcessLookupError:
-                pass
+            if hasattr(os, "killpg") and term.master_fd is not None:
+                try:
+                    os.killpg(term.proc.pid, signal.SIGHUP)
+                except ProcessLookupError:
+                    pass
+            else:
+                term.proc.terminate()
             try:
                 term.proc.wait(timeout=1.5)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(term.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                if hasattr(os, "killpg") and term.master_fd is not None:
+                    try:
+                        os.killpg(term.proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    term.proc.kill()
     finally:
         try:
-            os.close(term.master_fd)
+            if term.stdin_pipe is not None:
+                term.stdin_pipe.close()
+        except OSError:
+            pass
+        try:
+            if term.stdout_pipe is not None:
+                term.stdout_pipe.close()
+        except OSError:
+            pass
+        try:
+            if term.master_fd is not None:
+                os.close(term.master_fd)
         except OSError:
             pass
     return True

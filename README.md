@@ -202,7 +202,15 @@ docker compose -f docker-compose.two-container.yml up -d
 docker compose -f docker-compose.three-container.yml up -d
 ```
 
-Both compose files use **named Docker volumes** by default, which solves the UID/GID problem by construction. If you need bind mounts to share an existing host directory, see [`docs/docker.md`](docs/docker.md) for the full migration recipe.
+If you already have Hermes Agent running in a separate checkout/container stack and only want this repo's WebUI, use:
+
+```bash
+docker compose -f docker-compose.existing-agent.yml up -d
+```
+
+That file starts a separate WebUI container only. It does not replace an existing dashboard on `9119` or an existing gateway container; it reuses the current Hermes home directory and current `hermes-agent` checkout. See [`docs/docker.md`](docs/docker.md) for the exact mount and override details.
+
+The two- and three-container compose files use **named Docker volumes** by default, which solves the UID/GID problem by construction. If you need bind mounts to share an existing host directory, or want to attach this repo's WebUI to an already-running Hermes Agent stack, see [`docs/docker.md`](docs/docker.md) for the full migration recipe.
 
 > **Known limitation (#681)**: in the two-container setup, tools triggered from the WebUI run in the **WebUI container**, not the agent container. If you need git/node/etc. on the WebUI's filesystem, either use the single-container setup, extend the WebUI Dockerfile, or use the community [all-in-one image](https://github.com/sunnysktsang/hermes-suite).
 

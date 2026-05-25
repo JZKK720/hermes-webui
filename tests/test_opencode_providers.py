@@ -117,7 +117,7 @@ def test_live_models_handler_delegates_to_provider_model_ids():
     rather than maintain its own per-provider fetch logic.
     """
     import pathlib
-    routes_src = (pathlib.Path(__file__).parent.parent / "api" / "routes.py").read_text()
+    routes_src = (pathlib.Path(__file__).parent.parent / "api" / "routes.py").read_text(encoding='utf-8')
     assert "provider_model_ids" in routes_src, (
         "_handle_live_models must call hermes_cli.models.provider_model_ids() "
         "to delegate all provider-specific live-fetch logic to the agent"
@@ -139,7 +139,7 @@ def test_live_models_ui_no_longer_skips_any_provider():
     handles them all (with graceful fallback to static lists).
     """
     import pathlib
-    ui_src = (pathlib.Path(__file__).parent.parent / "static" / "ui.js").read_text()
+    ui_src = (pathlib.Path(__file__).parent.parent / "static" / "ui.js").read_text(encoding='utf-8')
     # The old exclusion list must be gone
     assert "includes(provider)" not in ui_src or "anthropic" not in ui_src[:ui_src.find("includes(provider)")+100], (
         "_fetchLiveModels must not skip anthropic, google, or gemini — "

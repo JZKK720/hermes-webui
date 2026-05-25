@@ -13,6 +13,7 @@ import os
 import stat
 import subprocess
 import concurrent.futures
+import hashlib
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -409,6 +410,27 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _is_within_or_mount_alias(path: Path, root: Path) -> bool:
+    """Return True if *path* is inside *root* or under a mount-path alias of it.
+
+    Docker attach workflows can expose the same host workspace at two in-container
+    paths (for example ``/workspace`` and ``/opt/data/workspace``). ``resolve()``
+    preserves those bind-mount spellings, so ``relative_to()`` alone sees them as
+    unrelated trees. Walk the candidate's ancestors and accept the path when any
+    ancestor refers to the same underlying directory as the trusted root.
+    """
+    if _is_within(path, root):
+        return True
+
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.samefile(root):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _trusted_workspace_roots() -> list[Path]:
     roots: list[Path] = []
 
@@ -571,16 +593,17 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
     except Exception:
         pass
 
-    # (C) Trusted if it is equal to or under the boot-time DEFAULT_WORKSPACE.
-    #     In Docker deployments HERMES_WEBUI_DEFAULT_WORKSPACE is often set to a
-    #     volume mount outside the user's home (e.g. /data/workspace).  That path
-    #     was already validated at server startup, so any sub-path of it is safe
-    #     without requiring the user to add it to the workspace list manually.
+    # (C) Trusted if it is equal to, under, or mounted as an alias of the
+    #     boot-time DEFAULT_WORKSPACE. In Docker deployments
+    #     HERMES_WEBUI_DEFAULT_WORKSPACE is often set to a volume mount outside
+    #     the user's home (e.g. /data/workspace). That path was already
+    #     validated at server startup, so any sub-path of it is safe without
+    #     requiring the user to add it to the workspace list manually.
     try:
         boot_default = Path(_BOOT_DEFAULT_WORKSPACE).expanduser().resolve()
-        candidate.relative_to(boot_default)
-        return candidate
-    except ValueError:
+        if _is_within_or_mount_alias(candidate, boot_default):
+            return candidate
+    except Exception:
         pass
 
     raise ValueError(
@@ -737,6 +760,25 @@ def list_dir(workspace: Path, rel: str='.'):
         if len(entries) >= 200:
             break
     return entries
+
+
+def dir_signature(workspace: Path, rel: str = '.', entries: list[dict] | None = None) -> str:
+    """Return a cheap, stable signature for a listed workspace directory."""
+    if entries is None:
+        entries = list_dir(workspace, rel)
+    payload = []
+    for entry in entries:
+        payload.append({
+            'name': entry.get('name'),
+            'path': entry.get('path'),
+            'type': entry.get('type'),
+            'is_dir': entry.get('is_dir'),
+            'size': entry.get('size'),
+            'mtime_ns': entry.get('mtime_ns'),
+            'target': entry.get('target'),
+        })
+    raw = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
 def read_file_content(workspace: Path, rel: str) -> dict:

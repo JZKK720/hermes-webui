@@ -209,6 +209,12 @@ def test_terminal_process_does_not_mutate_global_terminal_cwd(tmp_path, monkeypa
         close_terminal(sid)
 
 
+def test_terminal_safe_env_preserves_pythonpath_for_shell_packages():
+    terminal_py = _read("api/terminal.py")
+    allowlist_block = terminal_py.split("_SAFE_ENV_KEYS = {", 1)[1].split("}", 1)[0]
+    assert '"PYTHONPATH"' in allowlist_block
+
+
 def test_terminal_output_preserves_control_sequences_for_xterm():
     import codecs
     from api.terminal import _decode_terminal_output

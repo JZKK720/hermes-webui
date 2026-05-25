@@ -165,7 +165,22 @@ Instead, it reuses two things from the live agent setup:
 - the existing Hermes home directory (`HERMES_HOME`) as the WebUI's `/home/hermeswebui/.hermes`
 - the existing `hermes-agent` source checkout mounted read-only at `/opt/hermes`
 
+The attach compose also exports `HERMES_WEBUI_AGENT_DIR=/opt/hermes`, so the WebUI can still see the mounted checkout for path-based agent discovery even when reduced mode skips dependency installation.
+
 For workspace compatibility, this attach compose mounts the same host workspace at both `/workspace` and `/opt/data/workspace`. The second path matches the common `terminal.cwd` already stored in many existing Hermes configs, so command-agent shell tools keep working without editing the shared `config.yaml`.
+
+Workspace trust treats those two mount aliases as equivalent when they point at the same underlying directory, so sessions or saved settings that use either spelling do not need a duplicate manual workspace registration.
+
+If the attached Hermes stack should use a local Ollama reachable from the container, you can now keep those operator-facing values in the repo-local `.env` next to this checkout. On startup, the existing-agent attach bootstrap mirrors them into the mounted Hermes home's `.env` and `config.yaml`, which remain the runtime surfaces used by the attached stack. For Docker Desktop on Windows, the working local-server pattern is:
+
+- repo `.env`: `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1`
+- repo `.env`: `OLLAMA_API_KEY=no-key-required`
+- repo `.env`: `HERMES_MODEL=nemotron3:33b-q8`
+- shared `${HERMES_AGENT_HOST_HOME}/config.yaml`: `model.provider: custom`
+- shared `${HERMES_AGENT_HOST_HOME}/config.yaml`: `model.base_url: http://host.docker.internal:11434/v1`
+- shared `${HERMES_AGENT_HOST_HOME}/config.yaml`: `model.default: nemotron3:33b-q8` when `HERMES_MODEL` is set
+
+Use `provider: custom` for local Ollama in this attach workflow. `provider: ollama` currently follows Ollama Cloud semantics in the attached runtime, so it is the wrong fit for a local `host.docker.internal` endpoint.
 
 Operator note: shared Hermes config/model/provider state and WebUI chat history are different state surfaces. A successful attach should reflect the mounted `HERMES_HOME` configuration quickly, but a newly attached WebUI can still show an empty conversation list because WebUI session history lives under the WebUI state directory (`.../webui/`) and is not the same thing as the agent gateway or dashboard runtime state.
 
@@ -175,11 +190,32 @@ Run it like this:
 docker compose -f docker-compose.existing-agent.yml up -d
 ```
 
-This attach workflow supports a **read-only mounted** `hermes-agent` checkout, including common Windows + Docker Desktop setups. The WebUI stages a temporary writable copy for dependency installation at container startup, so you do not need to make the host checkout writable inside the container.
+This attach workflow supports a **read-only mounted** `hermes-agent` checkout, including common Windows + Docker Desktop setups.
 
-The existing-agent attach compose also sets `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES=reportlab`, so PDF generation libraries stay available to command-agent shell sessions after container recreates. If you need more shell-visible Python packages in this workflow, extend that env var with a whitespace-separated list.
+The existing-agent attach compose no longer enables reduced mode by default. On startup it can self-heal a reused `/app/venv` by installing:
 
-This compose file pulls the upstream GHCR WebUI image by default (`ghcr.io/nesquena/hermes-webui:latest`), so `docker compose pull` can pick up published WebUI updates without rebuilding locally. Standardize this attach workflow on the upstream `latest` tag rather than a fork-specific image unless you intentionally need fork-only behavior.
+- the mounted `hermes-agent` checkout's base Python dependencies
+- the optional `hindsight-client` memory-provider package when needed
+
+Reduced mode is still available if you explicitly uncomment `HERMES_WEBUI_SKIP_AGENT_INSTALL=1`, but that disables those startup-time repairs and leaves the WebUI in a browsing-only mode.
+
+To keep that attach workflow aligned with the upstream GHCR image while still reducing recreate cost, the compose file also persists two named Docker volumes by default:
+
+- `/app/venv` — reuses the WebUI virtual environment across container recreates
+- `/uv_cache` — reuses package download/build cache across container recreates
+
+The first boot still has to create the venv and install the WebUI runtime dependency set, but later `docker compose up -d --force-recreate` runs can reuse that state instead of rebuilding from scratch.
+
+If you intentionally want a totally fresh bootstrap, remove those named volumes before recreating the attach container:
+
+```bash
+docker compose -f docker-compose.existing-agent.yml down
+docker volume rm hermes-webui_hermes-webui-attach-venv hermes-webui_hermes-webui-attach-uv-cache
+```
+
+If you want shell-visible Python packages such as `reportlab` in this workflow, set `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES=reportlab` in the local Compose `.env`, export it when invoking `docker compose`, or preinstall those packages in a derived image. When enabled, the attach bootstrap installs those extras into a persistent target under `/app/venv` and exposes that directory through `PYTHONPATH` for command-agent shells. Those extras remain optional so the attach container can reach the WebUI server path without blocking default startup on an external package fetch.
+
+This compose file pulls the upstream GHCR WebUI image by default (`ghcr.io/nesquena/hermes-webui:0.51.103`). You can override it with `HERMES_WEBUI_IMAGE`, but the default stays pinned to a published upstream tag so `docker compose pull` can pick up known-good releases without rebuilding locally.
 
 Defaults assume a sibling checkout layout:
 
@@ -191,9 +227,13 @@ Optional overrides:
 - `HERMES_AGENT_REPO` — host path to the existing `hermes-agent` checkout
 - `HERMES_AGENT_HOST_HOME` — host path to the existing Hermes home directory
 - `HERMES_WORKSPACE` — host path mounted at both `/workspace` and `/opt/data/workspace`
-- `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES` — whitespace-separated Python packages installed into the command-agent shell environment on container start
+- `HERMES_WEBUI_IMAGE` — override the pinned upstream GHCR image tag used by the existing-agent attach compose
+- `HERMES_WEBUI_SKIP_AGENT_INSTALL` — optional reduced-functionality attach mode; skips agent and Hindsight startup repairs
+- `HERMES_WEBUI_EXTRA_SHELL_PYTHON_PACKAGES` — optional whitespace-separated Python packages installed into a persistent command-agent shell target under `/app/venv` on container start
 - `HERMES_WEBUI_HOST_PORT` — host port for the new WebUI container; changes the host mapping only
 - `HERMES_WEBUI_BIND_HOST` — bind address for the new WebUI container (default `127.0.0.1`)
+- `UV_HTTP_TIMEOUT` — timeout in seconds for first-boot Python package downloads in the attach workflow (default `120`)
+- `UV_HTTP_RETRIES` — retry count for first-boot Python package downloads in the attach workflow (default `5`)
 
 The container-internal WebUI port remains `8787`. If `8787` is busy on your host, remap the host side only, for example:
 
@@ -202,6 +242,15 @@ HERMES_WEBUI_HOST_PORT=8790 docker compose -f docker-compose.existing-agent.yml 
 ```
 
 This attach workflow still inherits the normal two-container limitation: agent processes started from the WebUI run in the **WebUI container**, not in the existing gateway container. If you need extra tools inside chat, install them in the WebUI image.
+
+The default attach image reference is pinned to `ghcr.io/nesquena/hermes-webui:0.51.103`. If you need a different upstream release for this attach workflow, override the image reference with a specific GHCR tag:
+
+```bash
+HERMES_WEBUI_IMAGE=ghcr.io/nesquena/hermes-webui:0.51.103 docker compose -f docker-compose.existing-agent.yml pull
+HERMES_WEBUI_IMAGE=ghcr.io/nesquena/hermes-webui:0.51.103 docker compose -f docker-compose.existing-agent.yml up -d --force-recreate
+```
+
+When `HERMES_WEBUI_IMAGE` is unset, the existing-agent compose uses upstream GHCR tag `0.51.103` by default. This attach file also bind-mounts the checked-out [`api/workspace.py`](../api/workspace.py) over `/apptoo/api/workspace.py` inside the container so the workspace trust fix for `/workspace` and `/opt/data/workspace` lands immediately on that GHCR image. Other unreleased local source changes still will not appear in upstream GHCR until they are merged upstream and published in a tagged release.
 
 ## Bind-mount migration (advanced)
 

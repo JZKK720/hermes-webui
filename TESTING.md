@@ -1786,6 +1786,7 @@ Each has automated API-level tests in `tests/test_sprint{N}.py`.
 - Desktop viewport (>640px): no hamburger or mobile overlay; desktop layout unchanged.
 - Docker: `docker compose up -d` starts server on port 8787.
 - Docker: session data persists across container restarts (named volume).
+- Docker existing-agent attach: with the upstream GHCR image plus the compose-mounted `api/workspace.py` overlay, opening either `/workspace` or `/opt/data/workspace` does not raise `Path is outside the user home directory...`.
 
 ### Sprint 22: Multi-Profile Support
 - Profile chip in topbar (purple accent). Click → dropdown with all profiles.

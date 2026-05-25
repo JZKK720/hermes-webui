@@ -1636,7 +1636,10 @@ consciously registering an external path (e.g. `/mnt/d/Projects` in WSL), so we 
 
 **`resolve_trusted_workspace(path)`** — used for actual file read/write operations inside
 an existing workspace. Strict: path must be under home, in the saved workspace list, or under
-`BOOT_DEFAULT_WORKSPACE`. Prevents path traversal and unauthorized file access.
+`BOOT_DEFAULT_WORKSPACE`. Docker attach workflows may expose that default workspace through
+multiple bind-mount spellings (for example `/workspace` and `/opt/data/workspace`); the resolver
+accepts aliases that refer to the same underlying directory as the boot default. This still
+prevents path traversal and unauthorized file access.
 
 The distinction matters because add uses permissive validation to avoid the circular
 dependency: you cannot get a path into the saved list if you need the saved list to add it.
