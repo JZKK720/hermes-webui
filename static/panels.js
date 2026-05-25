@@ -12,6 +12,8 @@ let _kanbanLanesByProfile = false;
 let _kanbanCurrentBoard = null;
 let _kanbanBoardsList = null;
 let _kanbanBoardMenuOpen = false;
+let _kanbanIsDispatching = false;
+let _kanbanSuppressCardClickUntil = 0;
 // SSE event stream — replaces the 30s polling cadence with a long-lived
 // /api/kanban/events/stream connection. Falls back to polling when the
 // EventSource fails to connect (proxy that strips text/event-stream, etc).
@@ -31,6 +33,7 @@ let _profilePreFormDetail = null;
 let _pendingSettingsTargetPanel = null; // destination selected while settings had unsaved changes
 let _logsAutoRefreshTimer = null;
 let _lastLogsLines = [];
+let _logsSeverityFilter = 'all';
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -179,9 +182,47 @@ function _consumeSettingsTargetPanel(fallback = 'chat') {
   return target;
 }
 
+function _resyncChatSidebarAfterPanelSwitch() {
+  if (_currentPanel !== 'chat') return;
+  if (typeof renderSessionListFromCache !== 'function') return;
+  const run = () => {
+    if (_currentPanel !== 'chat') return;
+    if (typeof _renamingSid !== 'undefined' && _renamingSid) return;
+    // If the user opens the per-conversation action menu immediately after
+    // returning to Chat, do not let the deferred sidebar resync tear it down.
+    // renderSessionListFromCache() intentionally closes that menu before it
+    // rebuilds rows, which is correct for normal list refreshes but hostile to
+    // this one-shot panel-transition repair.
+    if (typeof _sessionActionMenu !== 'undefined' && _sessionActionMenu) return;
+    renderSessionListFromCache();
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else run();
+}
+
 async function switchPanel(name, opts = {}) {
   const nextPanel = name || 'chat';
   const prevPanel = _currentPanel;
+  // ── Desktop sidebar collapse toggle (rail-click only) ──
+  // If the click came from a rail icon AND we're on desktop, the rail icon
+  // does double duty: clicking the already-active panel collapses the sidebar;
+  // clicking any panel while collapsed expands first. Programmatic switches
+  // (no opts.fromRailClick) are unaffected so legacy callers preserve
+  // behaviour exactly.
+  if (opts.fromRailClick && typeof _isSidebarCollapsed === 'function'
+      && typeof _isDesktopWidth === 'function' && _isDesktopWidth()) {
+    if (_isSidebarCollapsed()) {
+      // Expand first, then continue to the normal panel switch below so
+      // the clicked panel becomes (or stays) active in the same gesture.
+      expandSidebar();
+    } else if (prevPanel === nextPanel) {
+      // Same panel clicked while sidebar is open → collapse and short-circuit.
+      // Skip the guard/cleanup work below; nothing about the active panel
+      // is changing, only the visibility of the panel container.
+      toggleSidebar(true);
+      return false;
+    }
+  }
   if (!opts.bypassSettingsGuard && !_beforePanelSwitch(nextPanel)) return false;
   if (prevPanel !== 'settings' && nextPanel === 'settings') _beginSettingsPanelSession();
   // Close any long-lived Kanban SSE stream when leaving the kanban panel
@@ -192,6 +233,8 @@ async function switchPanel(name, opts = {}) {
   _currentPanel = nextPanel;
   // Update nav tabs (rail + mobile sidebar-nav share data-panel)
   document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === nextPanel));
+  // Refresh aria-expanded on the newly-active rail button to mirror sidebar state.
+  if (typeof _syncSidebarAria === 'function') _syncSidebarAria();
   // Update panel views
   document.querySelectorAll('.panel-view').forEach(p => p.classList.remove('active'));
   const panelEl = $('panel' + nextPanel.charAt(0).toUpperCase() + nextPanel.slice(1));
@@ -220,6 +263,13 @@ async function switchPanel(name, opts = {}) {
     switchSettingsSection(_currentSettingsSection);
     loadSettingsPanel();
   }
+  if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.getElementById('mobileOverlay');
+    if (sidebar) sidebar.classList.add('mobile-open');
+    if (overlay) overlay.classList.add('visible');
+  }
+  _resyncChatSidebarAfterPanelSwitch();
   syncAppTitlebar();
   return true;
 }
@@ -228,6 +278,26 @@ async function switchPanel(name, opts = {}) {
 function _isRecurringCronJob(job) {
   const kind = job && job.schedule && job.schedule.kind;
   return kind === 'cron' || kind === 'interval';
+}
+
+function _cronScheduleKindForInput(value) {
+  const schedule = String(value || '').trim();
+  if (!schedule) return '';
+  const lower = schedule.toLowerCase();
+  if (lower.startsWith('every ')) return 'interval';
+  if (lower.startsWith('@')) return 'cron';
+  const parts = schedule.split(/\s+/);
+  if (parts.length >= 5 && parts.slice(0, 5).every(p => /^[\d*\-,/]+$/.test(p))) return 'cron';
+  if (schedule.includes('T') || /^\d{4}-\d{2}-\d{2}/.test(schedule)) return 'once';
+  if (/^\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i.test(schedule)) return 'once';
+  return '';
+}
+
+function _syncCronScheduleWarning() {
+  const input = $('cronFormSchedule');
+  const warning = $('cronFormScheduleOnceWarning');
+  if (!input || !warning) return;
+  warning.style.display = _cronScheduleKindForInput(input.value) === 'once' ? '' : 'none';
 }
 
 function _hasUnlimitedRepeat(job) {
@@ -358,9 +428,44 @@ function _cronDiagnostics(job) {
   return JSON.stringify(fields, null, 2);
 }
 
+function _cronGatewayNoticeHtml(status) {
+  if (!status || (status.configured && status.running)) return '';
+  const notConfigured = !status.configured;
+  const title = notConfigured
+    ? 'Gateway not configured'
+    : 'Gateway not running';
+  const body = notConfigured
+    ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
+    : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
+  return `
+    <div class="detail-alert-title">${esc(title)}</div>
+    <p>${esc(body)}</p>
+  `;
+}
+
+async function loadCronGatewayNotice() {
+  const box = $('cronGatewayNotice');
+  if (!box) return;
+  try {
+    const status = await api('/api/gateway/status');
+    const html = _cronGatewayNoticeHtml(status);
+    if (html) {
+      box.innerHTML = html;
+      box.style.display = '';
+    } else {
+      box.innerHTML = '';
+      box.style.display = 'none';
+    }
+  } catch (_) {
+    box.innerHTML = '';
+    box.style.display = 'none';
+  }
+}
+
 async function loadCrons(animate) {
   const box = $('cronList');
   const refreshBtn = $('cronRefreshBtn');
+  loadCronGatewayNotice();
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
@@ -381,11 +486,13 @@ async function loadCrons(animate) {
       item.id = 'cron-' + job.id;
       const status = _cronStatusMeta(job);
       const isNewRun = _cronNewJobIds.has(String(job.id));
+      const isAgentMode = !job.no_agent;
       const profileLabel = _cronProfileLabel(job.profile);
       const profileTitle = _cronProfileTitle(job.profile);
       item.innerHTML = `
         <div class="cron-header">
           ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
+          ${isAgentMode ? '<span class="cron-agent-badge" title="Agent mode">🤖</span>' : ''}
           <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
           <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
           <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
@@ -409,6 +516,45 @@ async function loadCrons(animate) {
   }
 }
 
+function _cronPanelExpandKey(jobId, suffix){
+  return `hermes-webui-cron-${suffix}-expanded-${encodeURIComponent(String(jobId||''))}`;
+}
+
+function _cronRunExpandKey(jobId, filename){
+  return `${_cronPanelExpandKey(jobId, 'run')}-${encodeURIComponent(String(filename||''))}`;
+}
+
+function _cronExpansionGet(key){
+  try { return localStorage.getItem(key) === '1'; } catch(_) { return false; }
+}
+
+function _cronExpansionSet(key, expanded){
+  try { localStorage.setItem(key, expanded ? '1' : '0'); } catch(_) {}
+}
+
+function toggleCronPromptExpanded(jobId){
+  const key = _cronPanelExpandKey(jobId, 'prompt');
+  _cronExpansionSet(key, !_cronExpansionGet(key));
+  if (_currentCronDetail && String(_currentCronDetail.id) === String(jobId)) {
+    _renderCronDetail(_currentCronDetail);
+  }
+}
+
+function toggleCronRunExpanded(jobId, filename, runId){
+  const key = _cronRunExpandKey(jobId, filename);
+  const expanded = !_cronExpansionGet(key);
+  _cronExpansionSet(key, expanded);
+  const item = document.getElementById(runId);
+  const body = item ? item.querySelector('.detail-run-body') : null;
+  const btn = item ? item.querySelector('.detail-expand-toggle') : null;
+  if (body) body.classList.toggle('expanded', expanded);
+  if (btn) {
+    btn.textContent = expanded ? '▴' : '▾';
+    btn.title = expanded ? (t('cron_collapse_output') || 'Collapse output') : (t('cron_expand_output') || 'Expand output');
+    btn.setAttribute('aria-label', btn.title);
+  }
+}
+
 function _renderCronDetail(job){
   _currentCronDetail = job;
   const title = $('taskDetailTitle');
@@ -424,6 +570,11 @@ function _renderCronDetail(job){
   const deliver = job.deliver || 'local';
   const isNoAgent = !!job.no_agent;
   const cronJobMode = isNoAgent ? 'no-agent' : 'agent';
+  const modelProvider =
+    job.provider && job.model ? `${esc(job.provider)}/${esc(job.model)}` :
+    job.model ? esc(job.model) :
+    job.provider ? esc(job.provider) :
+    isNoAgent ? '' : 'default';
   const script = job.script || '';
   const profileLabel = _cronProfileLabel(job.profile);
   const profileTitle = _cronProfileTitle(job.profile);
@@ -443,6 +594,9 @@ function _renderCronDetail(job){
           <button type="button" class="cron-btn" onclick="copyCurrentCronDiagnostics()">${esc(t('cron_attention_copy_diagnostics'))}</button>
         </div>
       </div>` : '';
+  const toastNotifications = job.toast_notifications !== false;
+  const promptExpanded = _cronExpansionGet(_cronPanelExpandKey(job.id, 'prompt'));
+  const promptToggleLabel = promptExpanded ? (t('cron_collapse_prompt') || 'Collapse prompt') : (t('cron_expand_prompt') || 'Expand prompt');
   body.innerHTML = `
     <div class="main-view-content">
       ${attentionBanner}
@@ -453,15 +607,19 @@ function _renderCronDetail(job){
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_next'))}</div><div class="detail-row-value">${esc(nextRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_last'))}</div><div class="detail-row-value">${esc(lastRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">Deliver</div><div class="detail-row-value">${esc(deliver)}</div></div>
-        <div class="detail-row"><div class="detail-row-label">Mode</div><div class="detail-row-value"><span class="detail-badge" id="cronJobMode">${esc(cronJobMode)}</span></div></div>
+        <div class="detail-row"><div class="detail-row-label">Mode</div><div class="detail-row-value"><span class="detail-badge" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}</div></div>
         ${isNoAgent ? `<div class="detail-row"><div class="detail-row-label">No-agent script</div><div class="detail-row-value"><code>${esc(script || '—')}</code></div></div>` : ''}
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_profile_label') || 'Profile')}</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(profileTitle)}">${esc(profileLabel)}</span></div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</div><div class="detail-row-value"><span class="detail-badge ${toastNotifications ? 'active' : ''}">${esc(toastNotifications ? (t('cron_toast_notifications_enabled') || 'Enabled') : (t('cron_toast_notifications_disabled') || 'Disabled'))}</span></div></div>
         <div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(skills)}</div></div>
         ${lastError}
       </div>
       <div class="detail-card">
-        <div class="detail-card-title">Prompt</div>
-        <div class="detail-prompt">${esc(job.prompt || '')}</div>
+        <div class="detail-card-title detail-card-title-row">
+          <span>Prompt</span>
+          <button type="button" class="detail-expand-toggle" onclick="toggleCronPromptExpanded('${esc(job.id)}')" title="${esc(promptToggleLabel)}" aria-label="${esc(promptToggleLabel)}">${esc(promptExpanded ? '▴' : '▾')}</button>
+        </div>
+        <div class="detail-prompt ${promptExpanded ? 'expanded' : ''}">${esc(job.prompt || '')}</div>
       </div>
       <div class="detail-card ${_cronNewJobIds.has(String(job.id)) ? 'has-new-run' : ''}" id="cronDetailRuns">
         <div class="detail-card-title">${esc(t('cron_last_output'))}</div>
@@ -520,12 +678,18 @@ async function _loadCronDetailRuns(jobId){
       const sizeStr = run.size > 1024 ? (run.size/1024).toFixed(1)+' KB' : run.size+' B';
       const dateStr = new Date(run.modified * 1000).toLocaleString();
       const rid = `cron-det-run-${jobId}-${i}`;
+      const usageStrip = _formatCronRunUsageStrip(run.usage);
+      const runExpanded = _cronExpansionGet(_cronRunExpandKey(jobId, run.filename));
+      const runToggleLabel = runExpanded ? (t('cron_collapse_output') || 'Collapse output') : (t('cron_expand_output') || 'Expand output');
       return `<div class="detail-run-item" id="${rid}">
         <div class="detail-run-head" onclick="_loadRunContent('${esc(jobId)}','${esc(run.filename)}','${rid}')">
-          <span><span style="opacity:.7">${esc(ts)}</span> <span style="opacity:.4;font-size:11px">${esc(sizeStr)}</span></span>
-          <span style="opacity:.6">▸</span>
+          <span><span style="opacity:.7">${esc(ts)}</span> <span style="opacity:.4;font-size:11px">${esc(sizeStr)}</span>${usageStrip ? ` <span class="cron-run-usage-strip">${esc(usageStrip)}</span>` : ''}</span>
+          <span class="detail-run-actions">
+            <button type="button" class="detail-expand-toggle" onclick="event.stopPropagation();toggleCronRunExpanded('${esc(jobId)}','${esc(run.filename)}','${rid}')" title="${esc(runToggleLabel)}" aria-label="${esc(runToggleLabel)}">${esc(runExpanded ? '▴' : '▾')}</button>
+            <span style="opacity:.6">▸</span>
+          </span>
         </div>
-        <div class="detail-run-body" style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div>
+        <div class="detail-run-body ${runExpanded ? 'expanded' : ''}" style="color:var(--muted);font-size:12px">${esc(t('loading'))}</div>
       </div>`;
     }).join('');
     const countLabel = data.total > 50 ? ` (${data.total} runs, showing latest 50)` : ` (${data.total} runs)`;
@@ -540,6 +704,7 @@ async function _loadRunContent(jobId, filename, runId){
   if (!item.classList.contains('open')) {
     item.classList.add('open');
   }
+  body.classList.toggle('expanded', _cronExpansionGet(_cronRunExpandKey(jobId, filename)));
   body.innerHTML = `<span style="opacity:.5">${esc(t('loading'))}</span>`;
   try {
     const data = await api(`/api/crons/run?job_id=${encodeURIComponent(jobId)}&filename=${encodeURIComponent(filename)}`);
@@ -547,19 +712,31 @@ async function _loadRunContent(jobId, filename, runId){
       body.textContent = data.error;
       return;
     }
+    const expanded = _cronExpansionGet(_cronRunExpandKey(jobId, filename));
+    const output = expanded ? (data.content || data.snippet || '') : (data.snippet || data.content || '');
+    body.classList.toggle('expanded', expanded);
     // Render markdown content using the same renderer as chat messages
     if (typeof renderMd === 'function') {
-      body.innerHTML = renderMd(data.snippet || data.content);
+      body.innerHTML = renderMd(output);
     } else {
-      body.textContent = data.snippet || data.content;
+      body.textContent = output;
     }
-    // Show "View full output" button if content was truncated
-    if (data.content && data.snippet && data.content.length > data.snippet.length) {
+    const usageStrip = _formatCronRunUsageStrip(data.usage);
+    if (usageStrip) {
+      const usage = document.createElement('div');
+      usage.className = 'cron-run-usage-strip cron-run-usage-footer';
+      usage.textContent = usageStrip;
+      body.appendChild(usage);
+    }
+    // Show "View full output" button only for collapsed previews. Expanded rows render the full body inline.
+    if (!expanded && data.content && data.snippet && data.content.length > data.snippet.length) {
       const btn = document.createElement('button');
       btn.style.cssText = 'margin-top:8px;padding:4px 12px;border-radius:var(--radius-btn);border:1px solid var(--border-subtle);background:var(--surface-subtle);color:var(--text-secondary);cursor:pointer;font-size:12px';
       btn.textContent = t('cron_view_full_output') || 'View full output';
       btn.onclick = () => {
-        body.innerHTML = renderMd ? renderMd(data.content) : '';
+        _cronExpansionSet(_cronRunExpandKey(jobId, filename), true);
+        body.classList.add('expanded');
+        body.innerHTML = renderMd ? renderMd(data.content) : data.content;
         btn.remove();
       };
       body.appendChild(btn);
@@ -639,6 +816,7 @@ function duplicateCurrentCron(){
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
+    toast_notifications: job.toast_notifications !== false,
     isEdit: false,
   });
   if (!_cronSkillsCache) {
@@ -672,7 +850,7 @@ function openCronCreate(){
   _cronMode = 'create';
   _cronIsDuplicate = false;
   _cronSelectedSkills = [];
-  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', isEdit:false });
+  _renderCronForm({ name:'', schedule:'', prompt:'', deliver:'local', profile:'', toast_notifications:true, isEdit:false });
   _cronSkillsCache = null;
   api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
@@ -690,6 +868,7 @@ function openCronEdit(job){
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
+    toast_notifications: job.toast_notifications !== false,
     no_agent: !!job.no_agent,
     script: job.script || '',
     isEdit: true,
@@ -702,12 +881,13 @@ function openCronEdit(job){
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
-function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=false, script='', isEdit }){
+function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', isEdit }){
   const title = $('taskDetailTitle');
   const body = $('taskDetailBody');
   const empty = $('taskDetailEmpty');
   if (!body || !title) return;
   const isNoAgent = !!no_agent;
+  const toastNotifications = toast_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
   const deliverOpt = (v,l) => `<option value="${v}"${deliver===v?' selected':''}>${esc(l)}</option>`;
   body.innerHTML = `
@@ -721,6 +901,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
           <label for="cronFormSchedule">${esc(t('cron_schedule_label') || 'Schedule')}</label>
           <input type="text" id="cronFormSchedule" value="${esc(schedule || '')}" placeholder="0 9 * * *  —  every 1h  —  @daily" autocomplete="off" required>
           <div class="detail-form-hint">${esc(t('cron_schedule_hint') || "Cron expression or shorthand like 'every 1h'.")}</div>
+          <div id="cronFormScheduleOnceWarning" class="detail-form-warning cron-once-warning" style="display:none">${esc(t('cron_schedule_once_warning') || "Duration forms like '30m' run once and are removed after running. Use 'every 30m' to keep a recurring job.")}</div>
         </div>
         <div class="detail-form-row ${isNoAgent ? 'cron-no-agent-prompt-row' : ''}">
           <label for="cronFormPrompt">${esc(t('cron_prompt_label') || 'Prompt')}</label>
@@ -733,6 +914,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
             ${deliverOpt('local', t('cron_deliver_local') || 'Local (save output only)')}
             ${deliverOpt('discord','Discord')}
             ${deliverOpt('telegram','Telegram')}
+            ${deliverOpt('slack','Slack')}
           </select>
         </div>
         <div class="detail-form-row">
@@ -741,6 +923,13 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
             ${_cronProfileOptions(profile)}
           </select>
           <div class="detail-form-hint">${esc(t('cron_profile_server_default_hint') || 'Uses the WebUI server default profile at run time')}</div>
+        </div>
+        <div class="detail-form-row">
+          <label for="cronFormToastNotifications">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</label>
+          <label class="detail-form-check" for="cronFormToastNotifications">
+            <input type="checkbox" id="cronFormToastNotifications" ${toastNotifications ? 'checked' : ''}>
+            <span>${esc(t('cron_toast_notifications_hint') || 'Show a toast when this cron finishes.')}</span>
+          </label>
         </div>
         <div class="detail-form-row">
           <label for="cronFormSkillSearch">${esc(t('cron_skills_label') || 'Skills')}</label>
@@ -758,6 +947,12 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
   if (empty) empty.style.display = 'none';
   _setCronHeaderButtons(isEdit ? 'edit' : 'create');
   _renderCronSkillTags();
+  const scheduleEl = $('cronFormSchedule');
+  if (scheduleEl) {
+    scheduleEl.addEventListener('input', _syncCronScheduleWarning);
+    scheduleEl.addEventListener('change', _syncCronScheduleWarning);
+    _syncCronScheduleWarning();
+  }
   const focusEl = $('cronFormName');
   if (focusEl) focusEl.focus();
 }
@@ -827,6 +1022,7 @@ async function saveCronForm(){
   const promptEl=$('cronFormPrompt');
   const delivEl=$('cronFormDeliver');
   const profileEl=$('cronFormProfile');
+  const toastEl=$('cronFormToastNotifications');
   const errEl=$('cronFormError');
   if(!schEl||!promptEl||!errEl) return;
   const name=(nameEl?nameEl.value:'').trim();
@@ -834,13 +1030,14 @@ async function saveCronForm(){
   const prompt=promptEl.value.trim();
   const deliver=delivEl?delivEl.value:'local';
   const profile=profileEl?profileEl.value:'';
-  const isNoAgent = !!(_currentCronDetail && _currentCronDetail.no_agent);
+  const toastNotifications=toastEl?!!toastEl.checked:true;
+  const isNoAgent = !!(_cronPreFormDetail && _cronPreFormDetail.no_agent);
   errEl.style.display='none';
   if(!schedule){errEl.textContent=t('cron_schedule_required_example');errEl.style.display='';return;}
   if(!isNoAgent && !prompt){errEl.textContent=t('cron_prompt_required');errEl.style.display='';return;}
   try{
     if (_editingCronId) {
-      const updates = {job_id: _editingCronId, schedule, profile: profile};
+      const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
@@ -853,7 +1050,7 @@ async function saveCronForm(){
       if (job) openCronDetail(editedId);
       return;
     }
-    const body={schedule,prompt,deliver,profile: profile};
+    const body={schedule,prompt,deliver,profile: profile, toast_notifications: toastNotifications};
     if(_cronIsDuplicate) body.enabled=false;
     if(name)body.name=name;
     if(_cronSelectedSkills.length)body.skills=_cronSelectedSkills;
@@ -880,6 +1077,27 @@ function _cronOutputSnippet(content) {
   const responseIdx = lines.findIndex(l => l.startsWith('## Response') || l.startsWith('# Response'));
   const body = (responseIdx >= 0 ? lines.slice(responseIdx + 1) : lines).join('\n').trim();
   return body.slice(0, 600) || '(empty)';
+}
+
+function _formatCronRunUsageStrip(usage) {
+  if (!usage || typeof usage !== 'object') return '';
+  const parts = [];
+  const fmt = n => {
+    const value = Number(n || 0);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
+    if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k';
+    return String(Math.round(value));
+  };
+  const input = fmt(usage.input_tokens);
+  const output = fmt(usage.output_tokens);
+  const total = fmt(usage.total_tokens);
+  if (input || output) parts.push(`${input || '0'} in · ${output || '0'} out`);
+  else if (total) parts.push(`${total} tokens`);
+  const cost = Number(usage.estimated_cost_usd);
+  if (Number.isFinite(cost) && cost > 0) parts.push(`$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`);
+  if (usage.model) parts.push(String(usage.model));
+  return parts.join(' · ');
 }
 
 // ── Cron run watch ────────────────────────────────────────────────────────────
@@ -1056,17 +1274,188 @@ function _kanbanRenderSidebar(columns){
 }
 
 
+/**
+ * Render inline markdown (bold, italic, code, links, strikethrough).
+ * Input is already HTML-escaped.
+ */
 function _kanbanRenderMarkdownInline(escaped){
   return String(escaped || '')
+    .replace(/~~([^~\n]+)~~/g, (_m, text) => `<del>${text}</del>`)
     .replace(/`([^`\n]+)`/g, (_m, code) => `<code>${code}</code>`)
     .replace(/\*\*([^*\n]+)\*\*/g, (_m, text) => `<strong>${text}</strong>`)
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, (_m, prefix, text) => `${prefix}<em>${text}</em>`)
+    .replace(/(^|[^*a-zA-Z0-9])\*([^*\n]+)\*/g, (_m, prefix, text) => `${prefix}<em>${text}</em>`)
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, (_m, text, href) => `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`);
 }
 
+/**
+ * Render full markdown block content: headings, code blocks, lists, tables,
+ * task lists, blockquotes, horizontal rules, paragraphs + inline formatting.
+ */
 function _kanbanRenderMarkdown(source){
   if (!source) return '';
-  return `<div class="hermes-kanban-md">${esc(source).split(/\r?\n/).map(line => line.trim() ? `<p>${_kanbanRenderMarkdownInline(line)}</p>` : '').join('')}</div>`;
+  const lines = esc(source).split(/\r?\n/);
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // ── Code block ──
+    if (/^```/.test(trimmed)) {
+      const lang = trimmed.slice(3).trim();
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing ```
+      const codeHtml = codeLines.join('\n');
+      out.push(lang
+        ? `<pre class="hermes-kanban-code"><code class="language-${_kanbanRenderMarkdownInline(lang)}">${codeHtml}</code></pre>`
+        : `<pre class="hermes-kanban-code"><code>${codeHtml}</code></pre>`);
+      continue;
+    }
+
+    // ── Horizontal rule ──
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(trimmed)) {
+      out.push('<hr>');
+      i++;
+      continue;
+    }
+
+    // ── Heading ──
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      out.push(`<h${level}>${_kanbanRenderMarkdownInline(headingMatch[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // ── Blockquote ──
+    if (/^>\s?/.test(trimmed)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        quoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
+        i++;
+      }
+      out.push(`<blockquote>${_kanbanRenderMarkdownInline(quoteLines.join('<br>'))}</blockquote>`);
+      continue;
+    }
+
+    // ── Table row ──
+    if (/^\|.+\|$/.test(trimmed)) {
+      const tableRows = [];
+      const tableAligns = [];
+      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) {
+        const row = lines[i].trim();
+        // Detect alignment separator row
+        if (/^\|[\s:]*-{3,}[\s:]*\|/.test(row)) {
+          const cells = row.split('|').filter(c => c.trim().length > 0);
+          cells.forEach(c => {
+            const t = c.trim();
+            if (t.startsWith(':') && t.endsWith(':')) tableAligns.push('center');
+            else if (t.endsWith(':')) tableAligns.push('right');
+            else tableAligns.push('left');
+          });
+        } else {
+          const cells = row.split('|').filter(c => c.trim().length > 0);
+          tableRows.push(cells.map((c, ci) => {
+            const align = tableAligns[ci] ? ` style="text-align:${tableAligns[ci]}"` : '';
+            return `<td${align}>${_kanbanRenderMarkdownInline(c.trim())}</td>`;
+          }).join(''));
+        }
+        i++;
+      }
+      if (tableRows.length) {
+        out.push(`<table><tbody>${tableRows.map(r => `<tr>${r}</tr>`).join('')}</tbody></table>`);
+      }
+      continue;
+    }
+
+    // ── Task list item ──
+    const taskMatch = trimmed.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
+    if (taskMatch) {
+      const checked = taskMatch[1] !== ' ';
+      const text = taskMatch[2];
+      const items = [];
+      items.push(`<li class="hermes-kanban-task${checked ? ' checked' : ''}"><input type="checkbox"${checked ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(text)}</li>`);
+      i++;
+      // Collect continuation items
+      while (i < lines.length) {
+        const next = lines[i].trim();
+        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
+        const nextLi = next.match(/^[-*+]\s+(.+)$/);
+        if (nextTask) {
+          const c = nextTask[1] !== ' ';
+          items.push(`<li class="hermes-kanban-task${c ? ' checked' : ''}"><input type="checkbox"${c ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(nextTask[2])}</li>`);
+          i++;
+        } else if (nextLi) {
+          items.push(`<li>${_kanbanRenderMarkdownInline(nextLi[1])}</li>`);
+          i++;
+        } else {
+          break;
+        }
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+
+    // ── Unordered list item ──
+    const ulMatch = trimmed.match(/^[-*+]\s+(.+)$/);
+    if (ulMatch) {
+      const items = [];
+      items.push(`<li>${_kanbanRenderMarkdownInline(ulMatch[1])}</li>`);
+      i++;
+      while (i < lines.length) {
+        const next = lines[i].trim();
+        const nextUl = next.match(/^[-*+]\s+(.+)$/);
+        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
+        if (nextTask) break; // let task list handler get it
+        if (nextUl) {
+          items.push(`<li>${_kanbanRenderMarkdownInline(nextUl[1])}</li>`);
+          i++;
+        } else {
+          break;
+        }
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+
+    // ── Ordered list item ──
+    const olMatch = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (olMatch) {
+      const items = [];
+      items.push(`<li>${_kanbanRenderMarkdownInline(olMatch[1])}</li>`);
+      i++;
+      while (i < lines.length) {
+        const next = lines[i].trim();
+        const nextOl = next.match(/^\d+\.\s+(.+)$/);
+        if (nextOl) {
+          items.push(`<li>${_kanbanRenderMarkdownInline(nextOl[1])}</li>`);
+          i++;
+        } else {
+          break;
+        }
+      }
+      out.push(`<ol>${items.join('')}</ol>`);
+      continue;
+    }
+
+    // ── Empty line ──
+    if (!trimmed) {
+      out.push('');
+      i++;
+      continue;
+    }
+
+    // ── Paragraph ──
+    out.push(`<p>${_kanbanRenderMarkdownInline(trimmed)}</p>`);
+    i++;
+  }
+  return `<div class="hermes-kanban-md">${out.join('\n')}</div>`;
 }
 
 function _kanbanFormatDuration(seconds){
@@ -1096,10 +1485,9 @@ function _kanbanCardStalenessClass(task){
 function _kanbanCardQuickActions(task){
   const id = esc(task.id || '');
   const status = task.status || '';
-  const start = status !== 'running' && status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','running')">${esc(t('kanban_card_start'))}</button>` : '';
   const complete = status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','done')">${esc(t('kanban_card_complete'))}</button>` : '';
   const archive = status !== 'archived' ? `<button type="button" class="kanban-card-action danger" onclick="quickKanbanCardAction(event,'${id}','archived')">${esc(t('kanban_card_archive'))}</button>` : '';
-  return `<div class="kanban-card-actions" onclick="event.stopPropagation()">${start}${complete}${archive}</div>`;
+  return `<div class="kanban-card-actions" onclick="event.stopPropagation()">${complete}${archive}</div>`;
 }
 
 async function quickKanbanCardAction(event, taskId, status){
@@ -1107,10 +1495,31 @@ async function quickKanbanCardAction(event, taskId, status){
   return updateKanbanTask(taskId, {status});
 }
 
+function _kanbanSuppressNextCardClick(){
+  _kanbanSuppressCardClickUntil = Date.now() + 700;
+}
+
 function dragKanbanTask(event, taskId){
+  _kanbanSuppressNextCardClick();
   if (!event.dataTransfer) return;
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', taskId);
+}
+
+function finishKanbanDrag(event){
+  if (event) _kanbanSuppressNextCardClick();
+}
+
+function openKanbanCard(event, taskId){
+  if (Date.now() < _kanbanSuppressCardClickUntil) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    return false;
+  }
+  loadKanbanTask(taskId);
+  return false;
 }
 
 function allowKanbanDrop(event){
@@ -1133,10 +1542,13 @@ function clearKanbanDrop(event){
 }
 
 async function dropKanbanTask(event, status){
+  _kanbanSuppressNextCardClick();
   event.preventDefault();
+  event.stopPropagation();
   clearKanbanDrop(event);
   const taskId = event.dataTransfer ? event.dataTransfer.getData('text/plain') : '';
-  if (taskId && status) await updateKanbanTask(taskId, {status});
+  if (taskId && status) await updateKanbanTask(taskId, {status}, {openDetail: false});
+  _kanbanSuppressNextCardClick();
 }
 
 function _kanbanLaneNames(columns){
@@ -1168,17 +1580,25 @@ function _kanbanRenderProfileLanes(columns){
   }).join('')}</div>`;
 }
 
+function _kanbanEmptyBoardHtml(){
+  return `<div class="main-view-empty"><div class="main-view-empty-title">${esc(t('kanban_no_data'))}</div><div class="main-view-empty-sub">${esc(t('kanban_work_queue_hint'))}</div></div>`;
+}
+
 function _kanbanRenderBoard(){
   const board = $('kanbanBoard');
   if (!board) return;
   if (!_kanbanBoard || !_kanbanBoard.columns) {
-    board.innerHTML = `<div class="main-view-empty"><div class="main-view-empty-title">${esc(t('kanban_no_data'))}</div></div>`;
+    board.innerHTML = _kanbanEmptyBoardHtml();
     return;
   }
   const columns = _kanbanVisibleTasks();
   const total = columns.reduce((n, col) => n + (col.tasks || []).length, 0);
   if ($('kanbanSummary')) $('kanbanSummary').textContent = String(t('kanban_visible_tasks')).replace('{0}', total);
   _kanbanRenderSidebar(columns);
+  if (total === 0) {
+    board.innerHTML = _kanbanEmptyBoardHtml();
+    return;
+  }
   board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
 }
 
@@ -1191,7 +1611,7 @@ function _kanbanCard(task, status){
   const stale = _kanbanCardStalenessClass(task);
   const body = _kanbanTaskBody(task);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
-  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" onclick="loadKanbanTask('${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
+  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
@@ -1417,12 +1837,97 @@ function _kanbanBoardQuery(extra){
 }
 
 async function nudgeKanbanDispatcher(){
+  if (_kanbanIsDispatching) return;
+  // Dry-run dispatch: show what WOULD be spawned, without actually spawning
+  // workers.  Uses ?dry_run=1 so the dispatcher reports its plan without
+  // mutating the board.  The result shape includes spawned/skipped_unassigned/
+  // skipped_nonspawnable/promoted/auto_blocked so users can diagnose why a
+  // Ready task isn't being picked up before they commit to a real run.
+  _kanbanIsDispatching = true;
+  _setKanbanDispatcherButtonsDisabled(true);
   try {
     const dispatchEndpoint = '/api/kanban/dispatch';
-    await api(dispatchEndpoint + '?dry_run=1&max=1' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''), {method: 'POST'});
-    showToast(t('kanban_nudge_dispatcher'));
+    const result = await api(
+      dispatchEndpoint + '?dry_run=1&max=8' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''),
+      {method: 'POST'},
+    );
+    showToast(_kanbanFormatDispatchResult(result, true), 'info', 6000);
     await loadKanban(true);
-  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+  } catch(e) {
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error');
+  } finally {
+    _kanbanIsDispatching = false;
+    _setKanbanDispatcherButtonsDisabled(false);
+  }
+}
+
+async function runKanbanDispatcher(){
+  if (_kanbanIsDispatching) return;
+  // Real dispatch: claims Ready tasks and spawns worker subprocesses
+  // (one `hermes -p <assignee>` per claimed row, up to max=8 per call).
+  // Confirmation dialog first because this actually consumes API budget on
+  // each spawned worker.  Result toast surfaces what happened so users see
+  // the dispatcher actually doing work.
+  if (!_kanbanCurrentBoard) {
+    showToast(t('kanban_unavailable') || 'Kanban unavailable', 'error');
+    return;
+  }
+
+  _kanbanIsDispatching = true;
+  _setKanbanDispatcherButtonsDisabled(true);
+  try {
+    const ok = await showConfirmDialog({
+      title: t('kanban_run_dispatcher') || 'Run dispatcher',
+      message: t('kanban_run_dispatcher_confirm')
+        || 'This will claim Ready tasks on this board and spawn worker subprocesses (one per task, up to 8 per click). Continue?',
+      confirmLabel: t('kanban_run_dispatcher') || 'Run dispatcher',
+    });
+    if (!ok) return;
+    const dispatchEndpoint = '/api/kanban/dispatch';
+    const result = await api(
+      dispatchEndpoint + '?max=8' + (_kanbanCurrentBoard ? '&board=' + encodeURIComponent(_kanbanCurrentBoard) : ''),
+      {method: 'POST'},
+    );
+    showToast(_kanbanFormatDispatchResult(result, false), 'info', 8000);
+    await loadKanban(true);
+  } catch(e) {
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error');
+  } finally {
+    _kanbanIsDispatching = false;
+    _setKanbanDispatcherButtonsDisabled(false);
+  }
+}
+
+function _setKanbanDispatcherButtonsDisabled(disabled){
+  document.querySelectorAll('.kanban-run-dispatch-btn, .kanban-nudge-dispatch-btn').forEach((btn) => {
+    btn.disabled = !!disabled;
+    btn.classList.toggle('disabled', !!disabled);
+  });
+}
+
+function _kanbanFormatDispatchResult(result, dryRun){
+  // Produce a human-readable one-line summary of dispatch_once's output so
+  // users can see exactly what happened rather than a generic "OK" toast.
+  const r = result || {};
+  const spawned = (r.spawned || []).length;
+  const promoted = r.promoted || 0;
+  const reclaimed = r.reclaimed || 0;
+  const skippedUnassigned = (r.skipped_unassigned || []).length;
+  const skippedNonspawnable = (r.skipped_nonspawnable || []).length;
+  const autoBlocked = (r.auto_blocked || []).length;
+  const timedOut = (r.timed_out || []).length;
+  const crashed = (r.crashed || []).length;
+  const verb = dryRun ? (t('kanban_dispatch_preview_prefix') || 'Preview:') : (t('kanban_dispatch_run_prefix') || 'Dispatched:');
+  const parts = [];
+  parts.push(spawned + ' ' + (t('kanban_dispatch_spawned') || 'spawned'));
+  if (promoted) parts.push(promoted + ' ' + (t('kanban_dispatch_promoted') || 'promoted'));
+  if (reclaimed) parts.push(reclaimed + ' ' + (t('kanban_dispatch_reclaimed') || 'reclaimed'));
+  if (skippedUnassigned) parts.push(skippedUnassigned + ' ' + (t('kanban_dispatch_skipped_unassigned') || 'skipped (no assignee)'));
+  if (skippedNonspawnable) parts.push(skippedNonspawnable + ' ' + (t('kanban_dispatch_skipped_nonspawnable') || 'skipped (unknown profile)'));
+  if (autoBlocked) parts.push(autoBlocked + ' ' + (t('kanban_dispatch_auto_blocked') || 'auto-blocked'));
+  if (timedOut) parts.push(timedOut + ' ' + (t('kanban_dispatch_timed_out') || 'timed out'));
+  if (crashed) parts.push(crashed + ' ' + (t('kanban_dispatch_crashed') || 'crashed'));
+  return verb + ' ' + parts.join(', ');
 }
 
 function _kanbanSelectedTaskIds(){
@@ -1517,7 +2022,7 @@ function _kanbanCommentHtml(comment){
   const by = comment.author || comment.created_by || comment.actor || '';
   const at = _kanbanFormatTimestamp(comment.created_at || comment.ts || '');
   return `<div class="kanban-detail-row">
-    <div class="kanban-detail-row-main">${esc(body)}</div>
+    <div class="kanban-detail-row-main">${_kanbanRenderMarkdown(body)}</div>
     <div class="kanban-detail-row-meta">${esc([by, at].filter(Boolean).join(' · '))}</div>
   </div>`;
 }
@@ -1559,7 +2064,14 @@ function _kanbanLinksHtml(links){
 async function createKanbanTask(){
   const input = document.getElementById('kanbanNewTaskTitle');
   const title = input ? input.value.trim() : '';
-  if (!title) return;
+  if (!title) {
+    // Empty inline input (or a click on the panel-head "+" via openKanbanCreate)
+    // — open the full create-task modal so the user has somewhere obvious to
+    // type and configure the task. Mirrors the cron / skills pattern of routing
+    // header "+" clicks through to a clearly-modal create surface.
+    openKanbanCreate();
+    return;
+  }
   try {
     const created = await api('/api/kanban/tasks' + _kanbanBoardQuery(), {
       method: 'POST',
@@ -1571,15 +2083,457 @@ async function createKanbanTask(){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
-async function updateKanbanTask(taskId, patch){
+// ────────────────────────────────────────────────────────────────────────────
+// Kanban: create-task modal (panel-head "+" button entry point).
+//
+// Same `.kanban-modal-overlay` shell as openKanbanCreateBoard() so the two
+// flows look and behave identically (centered card, dim backdrop, ESC closes,
+// click-on-backdrop closes). The modal markup lives in static/index.html as
+// #kanbanTaskModal — see the section just above </body>. Submit hits the
+// existing /api/kanban/tasks POST endpoint (which already accepts title, body,
+// assignee, tenant, priority, status — see api/kanban_bridge.py:306).
+// ────────────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────────────
+// Kanban: create-task / edit-task modal (panel-head "+" + task-detail Edit
+// button entry points).
+//
+// Single modal serves both flows.  Title + submit-button labels and the
+// underlying submit verb (POST vs PATCH) flip based on `_kanbanTaskModalMode`.
+//
+// Same `.kanban-modal-overlay` shell as openKanbanCreateBoard() so the two
+// flows look and behave identically (centered card, dim backdrop, ESC closes,
+// click-on-backdrop closes). The modal markup lives in static/index.html as
+// #kanbanTaskModal — see the section just above </body>.
+//
+// The assignee field auto-completes against the union of (a) live Hermes
+// profile names from /api/profiles and (b) historical assignees on the
+// active board, with an inline hint that explains the dispatcher claim
+// contract — most users will pick a profile name from the dropdown rather
+// than type one.
+// ────────────────────────────────────────────────────────────────────────────
+
+let _kanbanTaskModalMode = 'create';   // 'create' | 'edit'
+let _kanbanTaskModalEditingId = null;  // task id when mode === 'edit'
+let _kanbanProfileNamesCache = null;   // populated lazily on first modal open
+let _kanbanProfileNamesCacheAt = 0;
+const _KANBAN_PROFILE_NAMES_CACHE_TTL_MS = 30000;
+function _invalidateKanbanProfileCache() {
+  _kanbanProfileNamesCache = null;
+  _kanbanProfileNamesCacheAt = 0;
+}
+let _kanbanTaskModalFocusCleanup = null;
+// Status the modal *displayed* on edit-mode open.  If the user doesn't touch
+// the dropdown, we must NOT send `status` in the PATCH payload — otherwise
+// editing a task whose real status is non-editable in this dropdown
+// (running/blocked/done/archived → mapped to 'triage' for display) would
+// silently demote the task on save.  See the regression caught during PR
+// review: editing a 'running' task without touching status was reclaiming
+// the worker and moving the task back to triage.
+let _kanbanTaskModalInitialDisplayedStatus = null;
+let _kanbanBoardModalFocusCleanup = null;
+
+async function _kanbanLoadProfileNames(){
+  // Hit /api/profiles once per session and cache for a short TTL.
+  // Returns an array of profile names (sorted, default first if present).
+  const hasFreshCache = (
+    Array.isArray(_kanbanProfileNamesCache) &&
+    (Date.now() - _kanbanProfileNamesCacheAt) < _KANBAN_PROFILE_NAMES_CACHE_TTL_MS
+  );
+  if (hasFreshCache) return _kanbanProfileNamesCache;
+  try {
+    const data = await api('/api/profiles');
+    const profiles = Array.isArray(data && data.profiles) ? data.profiles : [];
+    const names = profiles.map(p => p && p.name).filter(Boolean);
+    // Stable order: default first, then alphabetical.
+    names.sort((a, b) => {
+      if (a === 'default') return -1;
+      if (b === 'default') return 1;
+      return a.localeCompare(b);
+    });
+    _kanbanProfileNamesCache = names;
+    _kanbanProfileNamesCacheAt = Date.now();
+    return names;
+  } catch(_) {
+    _kanbanProfileNamesCache = [];
+    _kanbanProfileNamesCacheAt = Date.now();
+    return [];
+  }
+}
+
+async function _kanbanPopulateAssigneeSelect(currentValue){
+  const sel = document.getElementById('kanbanTaskModalAssignee');
+  if (!sel) return;
+  // Profile names: the canonical set the dispatcher can claim.
+  const profileNames = await _kanbanLoadProfileNames();
+  // Historical assignees from the active board: include them so users who
+  // assigned to a CLI lane (e.g. orion-cc) before still see those values.
+  const historicalAssignees = (_kanbanBoard && Array.isArray(_kanbanBoard.assignees))
+    ? _kanbanBoard.assignees
+    : [];
+  // Build a final ordered list, deduping.  Profiles come first, then any
+  // historical assignees that aren't profiles (rare but keeps round-tripping
+  // correct for tasks created via CLI).
+  const seen = new Set();
+  const profiles = [];
+  for (const name of profileNames) {
+    if (!seen.has(name)) { profiles.push(name); seen.add(name); }
+  }
+  const extras = [];
+  for (const name of historicalAssignees) {
+    if (name && !seen.has(name)) { extras.push(name); seen.add(name); }
+  }
+  // If the current value isn't in either bucket (e.g. an old CLI-created
+  // assignee that's since been deleted), preserve it as a final option so
+  // editing the task doesn't silently change its assignee.
+  if (currentValue && !seen.has(currentValue)) {
+    extras.push(currentValue);
+    seen.add(currentValue);
+  }
+  // The empty value maps to null on submit (intentionally unassigned).  Keep
+  // it last so the default-selected option is the first profile, not "no one".
+  let html = '';
+  if (profiles.length) {
+    html += `<optgroup label="${esc(t('kanban_assignee_profiles_label') || 'Hermes profiles')}">`;
+    html += profiles.map(v => `<option value="${esc(v)}"${v === currentValue ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    html += '</optgroup>';
+  }
+  if (extras.length) {
+    html += `<optgroup label="${esc(t('kanban_assignee_other_label') || 'Other (CLI lanes / removed profiles)')}">`;
+    html += extras.map(v => `<option value="${esc(v)}"${v === currentValue ? ' selected' : ''}>${esc(v)}</option>`).join('');
+    html += '</optgroup>';
+  }
+  // Final "no assignee" fallthrough — explicit so users know what they're choosing.
+  html += `<option value=""${(!currentValue) ? ' selected' : ''}>${esc(t('kanban_assignee_unassigned') || '— Unassigned (won\u2019t auto-run) —')}</option>`;
+  sel.innerHTML = html;
+}
+
+function openKanbanCreate(){
+  // Make sure the user is on the kanban panel so the resulting board reload is
+  // visible behind the modal.
+  if (typeof switchPanel === 'function' && _currentPanel !== 'kanban') switchPanel('kanban');
+  const modal = document.getElementById('kanbanTaskModal');
+  if (!modal) return;
+  _kanbanTaskModalMode = 'create';
+  _kanbanTaskModalEditingId = null;
+  _kanbanTaskModalInitialDisplayedStatus = null;  // create mode: always send status
+  // Default new tasks to "ready" so they're immediately claimable by the
+  // dispatcher (assuming the user picks an assignee).  Triage is for staging
+  // tasks that need human review before being marked actionable; users who
+  // want it can still pick it from the status dropdown.
+  _kanbanResetTaskModalFields({status: 'ready'});
+  _kanbanSetTaskModalStatusHint(null);
+  _kanbanSetTaskModalLabels('create');
+  _kanbanPopulateAssigneeSelect('').then(() => {
+    // After the dropdown is populated, default-select the first profile (not
+    // the "Unassigned" fallthrough).  This is the right hint: most users want
+    // to assign to *something* — they can pick "Unassigned" deliberately.
+    const sel = document.getElementById('kanbanTaskModalAssignee');
+    if (sel && sel.options.length > 0 && sel.value === '') {
+      const firstProfile = Array.from(sel.options).find(opt => opt.value !== '');
+      if (firstProfile) sel.value = firstProfile.value;
+    }
+  });
+  _kanbanPopulateTenantDatalist();
+  modal.hidden = false;
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  _kanbanTaskModalFocusCleanup = _trapModalFocus(modal);
+  setTimeout(() => {
+    const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+    if (titleEl) titleEl.focus();
+  }, 50);
+  document.addEventListener('keydown', _kanbanTaskModalKey);
+}
+
+async function openKanbanEdit(taskId){
+  // Triggered by the Edit button on the task detail view.  Fetches the task
+  // (rather than relying on whatever's cached locally) so the modal always
+  // reflects authoritative server state.
+  if (!taskId) return;
+  if (typeof switchPanel === 'function' && _currentPanel !== 'kanban') switchPanel('kanban');
+  const modal = document.getElementById('kanbanTaskModal');
+  if (!modal) return;
+  let task = null;
+  try {
+    const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
+    task = data && data.task;
+  } catch(e) {
+    showToast((t('kanban_unavailable') || 'Kanban unavailable') + ': ' + (e.message || e), 'error');
+    return;
+  }
+  if (!task) return;
+  _kanbanTaskModalMode = 'edit';
+  _kanbanTaskModalEditingId = task.id;
+  // Track the displayed status so submitKanbanTaskModal can detect whether
+  // the user actually picked a new value vs. the dropdown's mapped default.
+  // Without this, editing a 'running'/'blocked'/'done'/'archived' task whose
+  // real status maps to 'triage' for display would silently demote the task
+  // (the mapped 'triage' would land in the PATCH payload, and _patch_task
+  // would call _set_status_direct → reclaim worker → move to triage).
+  const initialDisplayedStatus = _kanbanEditableStatusFor(task.status);
+  const originalStatus = task.status || initialDisplayedStatus;
+  _kanbanTaskModalInitialDisplayedStatus = initialDisplayedStatus;
+  _kanbanResetTaskModalFields({
+    title: task.title || '',
+    body: task.body || '',
+    status: initialDisplayedStatus,
+    tenant: task.tenant || '',
+    priority: typeof task.priority === 'number' ? task.priority : 0,
+  });
+  // Populate the assignee select AFTER reset so the option exists when we
+  // call sel.value = currentAssignee.
+  await _kanbanPopulateAssigneeSelect(task.assignee || '');
+  _kanbanSetTaskModalStatusHint(originalStatus, initialDisplayedStatus);
+  _kanbanSetTaskModalLabels('edit');
+  _kanbanPopulateTenantDatalist();
+  modal.hidden = false;
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  _kanbanTaskModalFocusCleanup = _trapModalFocus(modal);
+  setTimeout(() => {
+    const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+    if (titleEl) { titleEl.focus(); titleEl.select(); }
+  }, 50);
+  document.addEventListener('keydown', _kanbanTaskModalKey);
+}
+
+function _kanbanEditableStatusFor(status){
+  // The modal's status select only offers triage/todo/ready (the user-writable
+  // states).  blocked/running/done/archived are reached via the detail-view
+  // status buttons or the dispatcher.  Map non-editable states to a sensible
+  // default so the user can still change them via the buttons after saving.
+  const editable = new Set(['triage', 'todo', 'ready']);
+  return editable.has(status) ? status : 'triage';
+}
+
+function _kanbanResetTaskModalFields(values){
+  const v = values || {};
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.value = (val == null ? '' : String(val));
+  };
+  set('kanbanTaskModalTitleInput', v.title || '');
+  set('kanbanTaskModalBody', v.body || '');
+  set('kanbanTaskModalStatus', v.status || 'triage');
+  // Assignee handled separately by _kanbanPopulateAssigneeSelect() because
+  // it's a <select> populated from /api/profiles + board history; setting
+  // .value before the options exist would silently fail.
+  set('kanbanTaskModalTenant', v.tenant || '');
+  set('kanbanTaskModalPriority', v.priority != null ? v.priority : 0);
+  const errEl = document.getElementById('kanbanTaskModalError');
+  if (errEl) { errEl.textContent = ''; delete errEl.dataset.warningShown; }
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  if (submitBtn) submitBtn.disabled = false;
+}
+
+function _kanbanSetTaskModalLabels(mode){
+  const titleH = document.getElementById('kanbanTaskModalTitle');
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  if (mode === 'edit') {
+    if (titleH) titleH.textContent = t('kanban_edit_task') || 'Edit task';
+    if (submitBtn) submitBtn.textContent = t('save') || 'Save';
+  } else {
+    if (titleH) titleH.textContent = t('kanban_new_task') || 'New task';
+    if (submitBtn) submitBtn.textContent = t('create') || 'Create';
+  }
+}
+
+function _kanbanSetTaskModalStatusHint(realStatus, editableStatus){
+  const hintEl = document.getElementById('kanbanTaskModalStatusOriginalHint');
+  if (!hintEl) return;
+  if (!realStatus || realStatus === editableStatus) {
+    hintEl.hidden = true;
+    hintEl.textContent = '';
+    return;
+  }
+  const statusLabel = t(`kanban_status_${realStatus}`) || realStatus;
+  hintEl.textContent = String(t('kanban_status_original_hint')).replace('{0}', statusLabel);
+  hintEl.hidden = false;
+}
+
+function _kanbanPopulateTenantDatalist(){
+  const tenants = (_kanbanBoard && Array.isArray(_kanbanBoard.tenants)) ? _kanbanBoard.tenants : [];
+  const tList = document.getElementById('kanbanTaskModalTenantList');
+  if (tList) tList.innerHTML = tenants.map(v => `<option value="${esc(v)}"></option>`).join('');
+}
+
+function _trapModalFocus(modalEl){
+  if (!modalEl) return () => {};
+  const selector = 'a[href], button, textarea, input, select, summary, [tabindex]:not([tabindex="-1"])';
+  const collect = () => {
+    const candidates = Array.from(modalEl.querySelectorAll(selector));
+    return candidates.filter((el) => {
+      if (el.disabled || el.hidden) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      return el.tabIndex >= 0;
+    });
+  };
+  let focusableEls = collect();
+  const onKeyDown = (ev) => {
+    if (ev.key !== 'Tab') return;
+    if (!focusableEls.length) {
+      ev.preventDefault();
+      return;
+    }
+    const current = document.activeElement;
+    let idx = focusableEls.indexOf(current);
+    if (idx === -1) {
+      ev.preventDefault();
+      focusableEls[0].focus();
+      return;
+    }
+    if (ev.shiftKey) idx -= 1;
+    else idx += 1;
+    idx = (idx + focusableEls.length) % focusableEls.length;
+    ev.preventDefault();
+    focusableEls[idx].focus();
+  };
+  modalEl.addEventListener('keydown', onKeyDown);
+  return () => {
+    modalEl.removeEventListener('keydown', onKeyDown);
+  };
+}
+
+function closeKanbanTaskModal(){
+  const modal = document.getElementById('kanbanTaskModal');
+  if (modal) modal.hidden = true;
+  _kanbanTaskModalMode = 'create';
+  _kanbanTaskModalEditingId = null;
+  _kanbanTaskModalInitialDisplayedStatus = null;
+  _kanbanSetTaskModalStatusHint(null, null);
+  if (_kanbanTaskModalFocusCleanup) {
+    _kanbanTaskModalFocusCleanup();
+    _kanbanTaskModalFocusCleanup = null;
+  }
+  document.removeEventListener('keydown', _kanbanTaskModalKey);
+}
+
+function _kanbanTaskModalKey(ev){
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    closeKanbanTaskModal();
+    return;
+  }
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    // Enter submits except when the focus is in the description textarea
+    // (where Enter should insert a newline).
+    const target = ev.target;
+    if (target && target.tagName === 'TEXTAREA') return;
+    const modal = document.getElementById('kanbanTaskModal');
+    if (modal && !modal.hidden) {
+      ev.preventDefault();
+      submitKanbanTaskModal();
+    }
+  }
+}
+
+async function submitKanbanTaskModal(){
+  const titleEl = document.getElementById('kanbanTaskModalTitleInput');
+  const bodyEl = document.getElementById('kanbanTaskModalBody');
+  const statusEl = document.getElementById('kanbanTaskModalStatus');
+  const assigneeEl = document.getElementById('kanbanTaskModalAssignee');
+  const tenantEl = document.getElementById('kanbanTaskModalTenant');
+  const priorityEl = document.getElementById('kanbanTaskModalPriority');
+  const errEl = document.getElementById('kanbanTaskModalError');
+  const submitBtn = document.getElementById('kanbanTaskModalSubmit');
+  const title = titleEl ? titleEl.value.trim() : '';
+  if (!title) {
+    if (errEl) errEl.textContent = t('kanban_title_required') || 'Title is required.';
+    if (titleEl) titleEl.focus();
+    return;
+  }
+  // Build payload — for create we omit defaulted fields so the backend chooses;
+  // for edit we send every field so users can clear assignee/tenant/body.
+  const isEdit = _kanbanTaskModalMode === 'edit';
+  const payload = {title};
+  const bodyVal = bodyEl ? bodyEl.value : '';
+  const assigneeVal = assigneeEl ? assigneeEl.value.trim() : '';
+  const tenantVal = tenantEl ? tenantEl.value.trim() : '';
+  const statusVal = statusEl ? statusEl.value : '';
+  const priorityRaw = priorityEl ? priorityEl.value : '';
+  if (isEdit) {
+    payload.body = bodyVal;
+    payload.assignee = assigneeVal || null;
+    payload.tenant = tenantVal || null;
+    // Only send status if the user actually changed the dropdown from the
+    // value the modal opened with.  Otherwise editing a 'running'/'blocked'/
+    // 'done'/'archived' task — whose real status maps to the dropdown's
+    // 'triage' default — would silently demote the task on every save.
+    if (statusVal && statusVal !== _kanbanTaskModalInitialDisplayedStatus) {
+      payload.status = statusVal;
+    }
+    const n = parseInt(priorityRaw, 10);
+    payload.priority = Number.isNaN(n) ? 0 : n;
+  } else {
+    if (bodyVal.trim()) payload.body = bodyVal;
+    if (statusVal) payload.status = statusVal;
+    if (assigneeVal) payload.assignee = assigneeVal;
+    if (tenantVal) payload.tenant = tenantVal;
+    if (priorityRaw !== '' && priorityRaw !== '0') {
+      const n = parseInt(priorityRaw, 10);
+      if (!Number.isNaN(n)) payload.priority = n;
+    }
+  }
+  // Soft warning: a Ready task with the explicit "Unassigned" option will sit
+  // forever because the dispatcher skips unassigned rows (kanban_db.py:3567).
+  // The dropdown now makes this an explicit choice (the user picked "—
+  // Unassigned (won't auto-run) —"), but we still surface a one-time confirm
+  // so they don't lose work to a typo.
+  if (statusVal === 'ready' && !assigneeVal) {
+    if (errEl && !errEl.dataset.warningShown) {
+      errEl.textContent = t('kanban_ready_needs_assignee')
+        || 'You picked Unassigned + Ready. The dispatcher will skip this task. Submit again to confirm, or pick a profile.';
+      errEl.dataset.warningShown = '1';
+      const sel = document.getElementById('kanbanTaskModalAssignee');
+      if (sel) sel.focus();
+      return;
+    }
+  }
+  if (submitBtn) submitBtn.disabled = true;
+  if (errEl) { errEl.textContent = ''; delete errEl.dataset.warningShown; }
+  try {
+    let saved;
+    if (isEdit && _kanbanTaskModalEditingId) {
+      saved = await api(
+        '/api/kanban/tasks/' + encodeURIComponent(_kanbanTaskModalEditingId) + _kanbanBoardQuery(),
+        {method: 'PATCH', body: JSON.stringify(payload)},
+      );
+    } else {
+      saved = await api('/api/kanban/tasks' + _kanbanBoardQuery(), {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+    closeKanbanTaskModal();
+    await loadKanban(true);
+    const savedId = saved && saved.task && saved.task.id;
+    if (savedId) {
+      await loadKanbanTask(savedId);
+    } else if (isEdit && _kanbanTaskModalEditingId) {
+      await loadKanbanTask(_kanbanTaskModalEditingId);
+    }
+  } catch(e) {
+    if (errEl) errEl.textContent = (e.message || String(e));
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+async function updateKanbanTask(taskId, patch, opts){
   if (!taskId || !patch) return;
   try {
+    const openDetail = !opts || opts.openDetail !== false;
     const updated = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery(), {
       method: 'PATCH',
       body: JSON.stringify(patch),
     });
     await loadKanban(true);
-    await loadKanbanTask((updated && updated.task && updated.task.id) || taskId);
+    if (openDetail) await loadKanbanTask((updated && updated.task && updated.task.id) || taskId);
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
@@ -1618,8 +2572,9 @@ function _kanbanRenderTaskDetail(data){
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
+      <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit('${esc(task.id)}')" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
-    <div class="kanban-task-preview-body">${esc(body)}</div>
+    <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">
@@ -1639,8 +2594,7 @@ async function loadKanbanTask(taskId){
   if (!taskId) return;
   try {
     const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
-    const logEndpoint = '/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery();
-    try { data.log = await api(logEndpoint + '?tail=65536'); } catch(e) { data.log = {}; }
+    try { data.log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536})); } catch(e) { data.log = {}; }
     _kanbanCurrentTaskId = taskId;
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
@@ -1895,6 +2849,11 @@ function openKanbanCreateBoard(){
   document.getElementById('kanbanBoardModalColor').value = '#7aa2ff';
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
+  _kanbanBoardModalFocusCleanup = _trapModalFocus(modal);
   // Auto-focus name field
   setTimeout(() => document.getElementById('kanbanBoardModalName').focus(), 50);
   // Auto-suggest slug from name as user types
@@ -1934,6 +2893,11 @@ function openKanbanRenameBoard(){
   document.getElementById('kanbanBoardModalColor').value = meta.color || '#7aa2ff';
   document.getElementById('kanbanBoardModalError').textContent = '';
   modal.hidden = false;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
+  _kanbanBoardModalFocusCleanup = _trapModalFocus(modal);
   setTimeout(() => document.getElementById('kanbanBoardModalName').focus(), 50);
   document.addEventListener('keydown', _kanbanBoardModalEsc);
 }
@@ -1945,6 +2909,10 @@ function _kanbanBoardModalEsc(ev){
 function closeKanbanBoardModal(){
   const modal = document.getElementById('kanbanBoardModal');
   if (modal) modal.hidden = true;
+  if (_kanbanBoardModalFocusCleanup) {
+    _kanbanBoardModalFocusCleanup();
+    _kanbanBoardModalFocusCleanup = null;
+  }
   document.removeEventListener('keydown', _kanbanBoardModalEsc);
 }
 
@@ -2057,6 +3025,32 @@ function _selectedLogsTail() {
   return [100,200,500,1000].includes(value) ? value : 200;
 }
 
+function _severityForLine(line) {
+  const text = String(line || '').toUpperCase();
+  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
+  if (/\b(WARNING|WARN)\b/.test(text)) return 'warning';
+  if (/\b(DEBUG)\b/.test(text)) return 'debug';
+  if (/\b(INFO)\b/.test(text)) return 'info';
+  return 'other';
+}
+
+function _filteredLogsLines() {
+  if (_logsSeverityFilter === 'all') return _lastLogsLines;
+  return _lastLogsLines.filter(line => {
+    const sev = _severityForLine(line);
+    if (_logsSeverityFilter === 'errors') return sev === 'error';
+    if (_logsSeverityFilter === 'warnings') return sev === 'warning' || sev === 'error';
+    return true;
+  });
+}
+
+function _applyLogsSeverityFilter() {
+  const el = $('logsSeverityFilter');
+  _logsSeverityFilter = (el && el.value) || 'all';
+  // Re-render from cached lines without re-fetching
+  _renderLogs({ lines: _lastLogsLines, hint: '', truncated: false, _fromFilter: true });
+}
+
 function _logLineSeverityClass(line) {
   const text = String(line || '').toUpperCase();
   if (/\b(WARNING|WARN)\b/.test(text)) return 'log-line-warning';
@@ -2104,14 +3098,19 @@ function _renderLogs(data) {
   const box = $('logsOutput');
   const status = $('logsStatus');
   if (!box) return;
-  const lines = Array.isArray(data && data.lines) ? data.lines : [];
-  _lastLogsLines = lines.slice();
+  const rawLines = Array.isArray(data && data.lines) ? data.lines : [];
+  // Only update cache when loading fresh data (not when re-rendering from filter)
+  if (data && !data._fromFilter) _lastLogsLines = rawLines.slice();
+  const displayLines = _filteredLogsLines();
   const hint = data && data.hint ? `<div class="logs-hint">${esc(data.hint)}</div>` : '';
   const truncated = data && data.truncated ? `<div class="logs-hint warn">${esc(t('logs_truncated_hint'))}</div>` : '';
-  if (!lines.length) {
-    box.innerHTML = `${hint}${truncated}<div class="logs-empty">${esc(t('logs_empty'))}</div>`;
+  const filterNote = _logsSeverityFilter !== 'all'
+    ? `<div class="logs-hint">${esc(displayLines.length + ' / ' + _lastLogsLines.length + ' ' + t('logs_filter_active'))}</div>`
+    : '';
+  if (!displayLines.length) {
+    box.innerHTML = `${hint}${truncated}${filterNote}<div class="logs-empty">${esc(t('logs_empty'))}</div>`;
   } else {
-    box.innerHTML = `${hint}${truncated}` + lines.map(line => {
+    box.innerHTML = `${hint}${truncated}${filterNote}` + displayLines.map(line => {
       const cls = _logLineSeverityClass(line);
       return `<div class="log-line ${cls}">${esc(line)}</div>`;
     }).join('');
@@ -2120,7 +3119,7 @@ function _renderLogs(data) {
   if (status) {
     const bytes = data && Number(data.total_bytes || 0);
     const when = data && data.mtime ? new Date(data.mtime * 1000).toLocaleString() : t('logs_no_mtime');
-    status.textContent = `${lines.length} / ${data.tail || _selectedLogsTail()} lines · ${bytes.toLocaleString()} bytes · ${when}`;
+    status.textContent = `${rawLines.length} / ${data.tail || _selectedLogsTail()} lines · ${bytes.toLocaleString()} bytes · ${when}`;
   }
 }
 
@@ -2148,9 +3147,10 @@ function _syncLogsAutoRefresh() {
 }
 
 async function copyLogsAll() {
-  const text = _lastLogsLines.join('\n');
+  const lines = _filteredLogsLines();
+  const text = lines.join('\n');
   try {
-    await navigator.clipboard.writeText(text);
+    await _copyText(text);
     showToast(t('logs_copied'));
   } catch(e) {
     showToast(t('copy_failed'), 'error');
@@ -2265,6 +3265,66 @@ function _renderLlmWikiStatus(d) {
     </div>`;
 }
 
+/**
+ * Bucket daily token rows for chart display.
+ * Returns rows unchanged when length <= 30 (per-day resolution).
+ * For longer ranges, groups consecutive days into buckets:
+ *   31–90 days → 2-day buckets
+ *   91–180 days → 3-day buckets
+ *   181–365 days → 8-day buckets
+ * Result is always <= ~52 bars.
+ * Each bucket row has:
+ *   - label: short label for axis (e.g. MM-DD or MM-DD–MM-DD)
+ *   - title: full tooltip title (e.g. 2026-01-01 – 2026-01-05)
+ *   - date: first date in bucket (used for date label slicing)
+ *   - input_tokens, output_tokens, sessions, cost: summed across bucket
+ */
+function _bucketDailyTokensForChart(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const len = rows.length;
+  if (len <= 30) return rows;  // per-day resolution for 7/30-day ranges
+
+  // Target <= 75 bars; derive bucket size
+  let bucketSize;
+  if (len <= 90) {
+    bucketSize = 2;
+  } else if (len <= 180) {
+    bucketSize = 3;
+  } else if (len <= 365) {
+    bucketSize = 8;  // <=52 bars for 365 days (ceil(365/8)=46)
+  } else {
+    bucketSize = 8;  // fallback for >365 (shouldn't occur in practice)
+  }
+
+  const result = [];
+  for (let i = 0; i < len; i += bucketSize) {
+    const slice = rows.slice(i, i + bucketSize);
+    const input_tokens = slice.reduce((s, r) => s + Number(r.input_tokens || 0), 0);
+    const output_tokens = slice.reduce((s, r) => s + Number(r.output_tokens || 0), 0);
+    const sessions = slice.reduce((s, r) => s + Number(r.sessions || 0), 0);
+    const cost = slice.reduce((s, r) => s + Number(r.cost || 0), 0);
+
+    const firstDate = slice[0].date;
+    const lastDate = slice[slice.length - 1].date;
+
+    // Label: short form for axis
+    const firstLabel = String(firstDate).slice(5);  // MM-DD
+    const lastLabel = String(lastDate).slice(5);
+    const label = (firstDate === lastDate) ? firstLabel : (firstLabel + '–' + lastLabel);
+
+    result.push({
+      label,
+      title: firstDate + (firstDate !== lastDate ? ' – ' + lastDate : ''),
+      date: firstDate,
+      input_tokens,
+      output_tokens,
+      sessions,
+      cost,
+    });
+  }
+  return result;
+}
+
 function _renderInsights(d, box, wikiStatus) {
   const fmtNum = n => Number(n || 0).toLocaleString();
   const fmtCost = c => {
@@ -2284,21 +3344,24 @@ function _renderInsights(d, box, wikiStatus) {
     { label: t('insights_cost'), value: fmtCost(d.total_cost), icon: li('dollar-sign', 18) },
   ];
 
-  // Daily token trend
+  // Daily token trend — bucket long ranges to avoid horizontal overflow
   const dailyTokens = Array.isArray(d.daily_tokens) ? d.daily_tokens : [];
+  const chartRows = _bucketDailyTokensForChart(dailyTokens);
   let dailyHtml = '';
-  if (dailyTokens.length) {
-    const maxDailyTokens = Math.max(...dailyTokens.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
-    const labelEvery = Math.max(Math.ceil(dailyTokens.length / 7), 1);
+  if (chartRows.length) {
+    const maxDailyTokens = Math.max(...chartRows.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
+    const labelEvery = Math.max(Math.ceil(chartRows.length / 7), 1);
     dailyHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_daily_tokens'))}</div><div class="insights-daily-token-chart">` +
-      dailyTokens.map((r, idx) => {
+      chartRows.map((r, idx) => {
         const input = Number(r.input_tokens || 0);
         const output = Number(r.output_tokens || 0);
         const inputPct = Math.max((input / maxDailyTokens) * 100, input ? 2 : 0).toFixed(1);
         const outputPct = Math.max((output / maxDailyTokens) * 100, output ? 2 : 0).toFixed(1);
-        const showLabel = idx === 0 || idx === dailyTokens.length - 1 || idx % labelEvery === 0;
-        const title = `${r.date} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
-        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(String(r.date).slice(5)) : ''}</span></div>`;
+        const showLabel = idx === 0 || idx === chartRows.length - 1 || idx % labelEvery === 0;
+        const titleDate = r.title || r.date;
+        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
+        const labelText = r.label !== undefined ? r.label : String(r.date).slice(5);
+        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(labelText) : ''}</span></div>`;
       }).join('') +
       `</div><div class="insights-daily-legend"><span><i class="insights-daily-legend-input"></i>${esc(t('insights_input_tokens'))}</span><span><i class="insights-daily-legend-output"></i>${esc(t('insights_output_tokens'))}</span></div></div>`;
   } else {
@@ -2370,7 +3433,7 @@ function _renderInsights(d, box, wikiStatus) {
       ${overviewCards.map(c => `<div class="insights-stat"><div class="insights-stat-icon">${c.icon}</div><div class="insights-stat-info"><div class="insights-stat-value">${c.value}</div><div class="insights-stat-label">${esc(c.label)}</div></div></div>`).join('')}
     </div>
     ${dailyHtml}
-    <div class="insights-row">
+    <div class="insights-row insights-usage-grid">
       ${tokenCards}
       ${modelsHtml}
     </div>
@@ -2457,9 +3520,23 @@ function renderSkills(skills) {
     sec.appendChild(hdr);
     for (const skill of items.sort((a,b) => a.name.localeCompare(b.name))) {
       const el = document.createElement('div');
-      el.className = 'skill-item';
+      el.className = 'skill-item' + (skill.disabled ? ' disabled' : '');
       el.style.display = collapsed ? 'none' : '';
-      el.innerHTML = `<span class="skill-name">${esc(skill.name)}</span><span class="skill-desc">${esc(skill.description||'')}</span>`;
+      const isDisabled = skill.disabled || false;
+      const toggle = document.createElement('span');
+      toggle.className = 'skill-toggle' + (isDisabled ? '' : ' enabled');
+      toggle.title = isDisabled ? t('skill_disabled') : t('skill_enabled');
+      toggle.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        toggleSkill(skill.name, !isDisabled);
+      });
+      const nameEl = document.createElement('span');
+      nameEl.className = 'skill-name';
+      nameEl.textContent = skill.name;
+      const descEl = document.createElement('span');
+      descEl.className = 'skill-desc';
+      descEl.textContent = skill.description || '';
+      el.append(toggle, nameEl, descEl);
       el.onclick = () => openSkill(skill.name, el);
       sec.appendChild(el);
     }
@@ -2469,6 +3546,28 @@ function renderSkills(skills) {
 
 function filterSkills() {
   if (_skillsData) renderSkills(_skillsData);
+}
+
+
+async function toggleSkill(name, currentlyEnabled) {
+  const newEnabled = !currentlyEnabled;
+  try {
+    const result = await api('/api/skills/toggle', {
+      method: 'POST',
+      body: JSON.stringify({ name, enabled: newEnabled })
+    });
+    if (result && result.ok) {
+      if (_skillsData) {
+        const skill = _skillsData.find(s => s.name === name);
+        if (skill) skill.disabled = !newEnabled;
+      }
+      renderSkills(_skillsData || []);
+    } else {
+      setStatus((result && result.error) || t('skill_toggle_failed'));
+    }
+  } catch(e) {
+    setStatus(t('skill_toggle_failed') + e.message);
+  }
 }
 
 // Currently selected skill detail — kept across panel switches so re-entering
@@ -2521,6 +3620,21 @@ function _renderSkillDetail(name, content, linkedFiles) {
   _setSkillHeaderButtons('read');
 }
 
+function _renderSkillError(name, message) {
+  const title = $('skillDetailTitle');
+  const body = $('skillDetailBody');
+  const empty = $('skillDetailEmpty');
+  if (title) title.textContent = name;
+  if (body) {
+    body.innerHTML = `<div class="main-view-content"><div class="detail-form-error" style="display:block">${esc(message || t('skill_load_failed'))}</div></div>`;
+    body.style.display = '';
+  }
+  if (empty) empty.style.display = 'none';
+  _currentSkillDetail = null;
+  _skillMode = 'empty';
+  _setSkillHeaderButtons('empty');
+}
+
 function _setSkillHeaderButtons(mode) {
   const editBtn = $('btnEditSkillDetail');
   const delBtn = $('btnDeleteSkillDetail');
@@ -2541,6 +3655,12 @@ async function openSkill(name, el) {
   _editingSkillName = null;
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`);
+    if (data && (data.success === false || data.error)) {
+      const message = data.error || t('skill_load_failed');
+      _renderSkillError(name, message);
+      setStatus(t('skill_load_failed') + message);
+      return;
+    }
     _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
@@ -2549,6 +3669,11 @@ async function openSkill(name, el) {
 async function openSkillFile(skillName, filePath) {
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`);
+    if (data && data.error) {
+      _renderSkillError(skillName, data.error);
+      setStatus(t('skill_file_load_failed') + data.error);
+      return;
+    }
     const body = $('skillDetailBody');
     if (!body) return;
     const ext = (filePath.split('.').pop() || '').toLowerCase();
@@ -2729,12 +3854,20 @@ async function deleteCurrentSkill() {
 
 // ── Memory (main view) ──
 let _memoryData = null;
-let _currentMemorySection = null; // 'memory' | 'user'
+let _notesSourcesData = null;
+let _notesSearchResults = [];
+let _notesSelectedSource = 'joplin';
+let _notesPreviewNote = null;
+let _notesSearchError = '';
+let _notesSearchLoading = false;
+let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_notes'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
+  { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
+  { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
 
 function _memorySectionMeta(key) {
@@ -2743,12 +3876,16 @@ function _memorySectionMeta(key) {
 
 function _memorySectionContent(key) {
   if (!_memoryData) return '';
-  return key === 'user' ? (_memoryData.user || '') : (_memoryData.memory || '');
+  if (key === 'user') return _memoryData.user || '';
+  if (key === 'soul') return _memoryData.soul || '';
+  return _memoryData.memory || '';
 }
 
 function _memorySectionMtime(key) {
   if (!_memoryData) return 0;
-  return key === 'user' ? (_memoryData.user_mtime || 0) : (_memoryData.memory_mtime || 0);
+  if (key === 'user') return _memoryData.user_mtime || 0;
+  if (key === 'soul') return _memoryData.soul_mtime || 0;
+  return _memoryData.memory_mtime || 0;
 }
 
 function _setMemoryHeaderButtons(mode) {
@@ -2757,12 +3894,84 @@ function _setMemoryHeaderButtons(mode) {
   const editBtn = $('btnEditMemoryDetail');
   const cancelBtn = $('btnCancelMemoryDetail');
   const saveBtn = $('btnSaveMemoryDetail');
-  if (mode === 'read') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
+  if (mode === 'read' && _currentMemorySection !== 'external_notes') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
   else if (mode === 'edit') { hide(editBtn); show(cancelBtn); show(saveBtn); }
   else { hide(editBtn); hide(cancelBtn); hide(saveBtn); }
 }
 
+function _renderExternalNotesSources() {
+  const title = $('memoryDetailTitle');
+  const body = $('memoryDetailBody');
+  const empty = $('memoryDetailEmpty');
+  if (!title || !body) return;
+  title.textContent = t('external_notes_sources');
+  const data = _notesSourcesData || {};
+  const sources = Array.isArray(data.sources) ? data.sources : [];
+  const recall = data.automatic_recall_unchanged !== false
+    ? `<div class="memory-detail-mtime">${esc(t('external_notes_auto_recall_hint'))}</div>`
+    : '';
+  if (!sources.length) {
+    body.innerHTML = `<div class="main-view-content">${recall}<div class="memory-empty">${esc(t('external_notes_empty'))}</div></div>`;
+  } else {
+    const selected = sources.find(src => (src.name || '').toLowerCase() === (_notesSelectedSource || '').toLowerCase()) || sources[0];
+    _notesSelectedSource = (selected && selected.name) || 'joplin';
+    const sourceOptions = sources.map(src => `<option value="${esc(src.name||'')}" ${src.name===_notesSelectedSource?'selected':''}>${esc(src.label||src.name||'')}</option>`).join('');
+    const recentAiNotes = Array.isArray(data.recent_ai_notes) ? data.recent_ai_notes : [];
+    const recentAiHtml = recentAiNotes.length
+      ? `<section class="notes-source-card notes-ai-recent-card">
+          <div class="notes-source-card-head notes-ai-recent-head"><strong>${li('bot', 14)}${esc(t('external_notes_recent_ai'))}</strong><span class="detail-badge">${esc(t('external_notes_auto'))}</span></div>
+          <div class="notes-ai-recent-list">${recentAiNotes.map(note => {
+            const updated = note.updated_time ? new Date(Number(note.updated_time)).toLocaleString() : '';
+            return `<button type="button" class="notes-result-card notes-ai-recent-item" onclick="previewExternalNote('${esc(note.source||'joplin')}','${esc(note.id||'')}')"><strong>${esc(note.title||note.label||'Untitled')}</strong><span>${li('clock', 14)}${esc(note.label||t('external_notes_recent_ai_reason'))}${updated ? ` · ${esc(updated)}` : ''}</span></button>`;
+          }).join('')}</div>
+        </section>`
+      : '';
+    const searchError = _notesSearchError ? `<div class="detail-form-error">${esc(_notesSearchError)}</div>` : '';
+    const resultHtml = _notesSearchResults.length
+      ? `<div class="notes-search-results">${_notesSearchResults.map(note => `<button type="button" class="notes-result-card" onclick="previewExternalNote('${esc(note.source||_notesSelectedSource)}','${esc(note.id||'')}')"><strong>${esc(note.title||'Untitled')}</strong>${note.snippet?`<span>${esc(note.snippet)}</span>`:''}</button>`).join('')}</div>`
+      : `<div class="memory-empty">${esc(t('external_notes_search_empty'))}</div>`;
+    const previewHtml = _notesPreviewNote
+      ? `<section class="notes-source-card notes-preview-card"><div class="notes-source-card-head"><strong>${esc(_notesPreviewNote.title||'Untitled')}</strong><span class="detail-badge">${esc(_notesPreviewNote.source||_notesSelectedSource)}</span></div><div class="memory-content preview-md">${renderMd(_notesPreviewNote.body||'')}</div></section>`
+      : '';
+    const cards = sources.map(src => {
+      const status = src.active ? t('source_active') : (src.status || t('source_configured'));
+      const tools = Array.isArray(src.tools) ? src.tools : [];
+      const hintHtml = src.tool_source === 'configured_hint'
+        ? `<div class="memory-detail-mtime">${esc(t('external_notes_configured_hint'))}</div>`
+        : '';
+      const toolHtml = tools.length
+        ? `<ul class="notes-source-tools">${tools.map(tool => `<li><strong>${esc(tool.name||'')}</strong>${tool.description?` — ${esc(tool.description)}`:''}</li>`).join('')}</ul>`
+        : `<div class="memory-empty">${esc(t('external_notes_no_tools'))}</div>`;
+      return `<section class="notes-source-card">
+        <div class="notes-source-card-head"><strong>${esc(src.label||src.name||'')}</strong><span class="detail-badge ${src.active?'active':''}">${esc(status)}</span></div>
+        <div class="memory-detail-mtime">${esc(t('external_notes_tool_count', src.tool_count||0))}</div>
+        ${hintHtml}
+        ${toolHtml}
+      </section>`;
+    }).join('');
+    const searchUi = `<section class="notes-source-card notes-search-card">
+      <form class="notes-search-form" onsubmit="event.preventDefault(); searchExternalNotes();">
+        <select id="externalNotesSource" onchange="selectExternalNotesSource(this.value)">${sourceOptions}</select>
+        <input id="externalNotesQuery" type="search" placeholder="${esc(t('external_notes_search_placeholder'))}" />
+        <button type="submit" class="btn-secondary">${esc(_notesSearchLoading ? t('loading') : t('search'))}</button>
+      </form>
+      ${searchError}
+      ${resultHtml}
+    </section>`;
+    body.innerHTML = `<div class="main-view-content">${recall}${recentAiHtml}${searchUi}${previewHtml}${cards}</div>`;
+  }
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _memoryMode = 'read';
+  _setMemoryHeaderButtons('read');
+}
+
 function _renderMemoryDetail(section) {
+  if (section === 'external_notes') {
+    _renderExternalNotesSources();
+    return;
+  }
+
   const meta = _memorySectionMeta(section);
   const title = $('memoryDetailTitle');
   const body = $('memoryDetailBody');
@@ -2809,15 +4018,78 @@ function _renderMemoryEdit(section) {
   if (ta) ta.focus();
 }
 
-function openMemorySection(section, el) {
+async function loadNotesSources(force) {
+  if (_notesSourcesData && !force) return _notesSourcesData;
+  try {
+    _notesSourcesData = await api('/api/notes/sources');
+  } catch (e) {
+    _notesSourcesData = {sources: [], automatic_recall_unchanged: true, error: e && e.message ? e.message : String(e)};
+  }
+  return _notesSourcesData;
+}
+
+function selectExternalNotesSource(source) {
+  _notesSelectedSource = source || 'joplin';
+  _notesSearchResults = [];
+  _notesPreviewNote = null;
+  _notesSearchError = '';
+  _renderExternalNotesSources();
+}
+
+async function searchExternalNotes() {
+  const input = $('externalNotesQuery');
+  const sourceEl = $('externalNotesSource');
+  const q = input ? input.value.trim() : '';
+  _notesSelectedSource = sourceEl ? sourceEl.value : (_notesSelectedSource || 'joplin');
+  _notesPreviewNote = null;
+  _notesSearchError = '';
+  if (!q) {
+    _notesSearchResults = [];
+    _renderExternalNotesSources();
+    return;
+  }
+  _notesSearchLoading = true;
+  _renderExternalNotesSources();
+  try {
+    const data = await api(`/api/notes/search?source=${encodeURIComponent(_notesSelectedSource)}&q=${encodeURIComponent(q)}&limit=20`);
+    _notesSearchResults = Array.isArray(data.results) ? data.results : [];
+    _notesSearchError = data.error || '';
+  } catch (e) {
+    _notesSearchResults = [];
+    _notesSearchError = e && e.message ? e.message : String(e);
+  } finally {
+    _notesSearchLoading = false;
+    _renderExternalNotesSources();
+    const nextInput = $('externalNotesQuery');
+    if (nextInput) nextInput.value = q;
+  }
+}
+
+async function previewExternalNote(source, id) {
+  _notesSearchError = '';
+  try {
+    const data = await api(`/api/notes/item?source=${encodeURIComponent(source||_notesSelectedSource)}&id=${encodeURIComponent(id||'')}`);
+    _notesPreviewNote = data && data.note ? data.note : null;
+  } catch (e) {
+    _notesPreviewNote = null;
+    _notesSearchError = e && e.message ? e.message : String(e);
+  }
+  _renderExternalNotesSources();
+}
+
+async function openMemorySection(section, el) {
+  if (section === 'external_notes' && _memoryData && !_memoryData.external_notes_enabled) return;
   _currentMemorySection = section;
   document.querySelectorAll('#memoryPanel .side-menu-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
+  if (section === 'external_notes') {
+    await loadNotesSources(false);
+  }
   _renderMemoryDetail(section);
 }
 
 function editCurrentMemory() {
-  if (!_currentMemorySection) return;
+  if (!_currentMemorySection || _currentMemorySection === 'external_notes') return;
   _renderMemoryEdit(_currentMemorySection);
 }
 
@@ -3088,6 +4360,24 @@ function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
   sc.addEventListener('click',()=>{ si.value=''; filterWs(''); si.focus(); });
 
   // ── Footer actions ────────────────────────────────────────────────────────
+  dd.appendChild(document.createElement('div')).className='ws-divider';
+  dd.appendChild(_renderWorkspaceAction(
+    t('workspace_new_worktree_conversation'),
+    t('workspace_new_worktree_conversation_meta'),
+    li('git-branch',12),
+    async()=>{
+      closeWsDropdown();
+      try{
+        await newSession(false,{worktree:true});
+        await renderSessionList();
+        const msg=$('msg');
+        if(msg)msg.focus();
+        showToast(t('workspace_worktree_created'));
+      }catch(e){
+        showToast(t('workspace_worktree_failed')+(e&&e.message?e.message:e),'error');
+      }
+    }
+  ));
   dd.appendChild(document.createElement('div')).className='ws-divider';
   dd.appendChild(_renderWorkspaceAction(
     t('workspace_choose_path'),
@@ -3605,6 +4895,38 @@ async function switchToWorkspace(path,name){
 
 // ── Profile panel + dropdown ──
 let _profilesCache = null;
+let _profileSwitchGeneration = 0;
+
+async function _profileSwitchPanelLoad(){
+  if (_currentPanel === 'skills') await loadSkills();
+  if (_currentPanel === 'memory') await loadMemory();
+  if (_currentPanel === 'tasks') await loadCrons();
+  if (_currentPanel === 'kanban') await loadKanban();
+  if (_currentPanel === 'profiles') await loadProfilesPanel();
+  if (_currentPanel === 'workspaces') await loadWorkspacesPanel();
+}
+
+function _refreshProfileSwitchBackground(gen){
+  window._modelDropdownReady=null;
+  if (typeof window._ensureModelDropdownReady === 'function') {
+    Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
+  }
+  Promise.resolve(loadWorkspaceList()).then(()=>{
+    if (gen !== _profileSwitchGeneration) return;
+    if (S.session && typeof syncTopbar === 'function') syncTopbar();
+  }).catch(()=>{});
+  // Reconcile per-profile sidebar tab visibility. hidden_tabs is a per-profile
+  // appearance setting; without this fetch, Profile A's hidden-tabs choice
+  // would remain in effect under Profile B until the user opens Settings.
+  // Stage-394 follow-up to #2636 deep review.
+  Promise.resolve(api('/api/settings')).then(function(s){
+    if (gen !== _profileSwitchGeneration) return;
+    var hidden = (s && Array.isArray(s.hidden_tabs)) ? s.hidden_tabs : [];
+    hidden = hidden.filter(function(x){ return typeof x === 'string' && x.trim(); });
+    if (typeof _setHiddenTabs === 'function') _setHiddenTabs(hidden);
+    if (typeof _applyTabVisibility === 'function') _applyTabVisibility(hidden);
+  }).catch(function(){});
+}
 
 async function loadProfilesPanel() {
   const panel = $('profilesPanel');
@@ -3613,8 +4935,22 @@ async function loadProfilesPanel() {
     const data = await api('/api/profiles');
     _profilesCache = data;
     panel.innerHTML = '';
+    const explainer = document.createElement('div');
+    explainer.className = 'profile-card profile-help-card';
+    explainer.innerHTML = `
+      <div class="profile-card-header">
+        <div style="min-width:0;flex:1">
+          <div class="profile-card-name">Profiles vs workspaces</div>
+          <div class="profile-card-meta">Use profiles for how the agent works; use workspaces for what files it works on.</div>
+        </div>
+      </div>`;
+    explainer.onclick = () => _renderProfileConceptHelp(data.active || 'default');
+    panel.appendChild(explainer);
     if (!data.profiles || !data.profiles.length) {
-      panel.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(t('profiles_no_profiles'))}</div>`;
+      const emptyMsg = document.createElement('div');
+      emptyMsg.style.cssText = 'padding:16px;color:var(--muted);font-size:12px';
+      emptyMsg.textContent = t('profiles_no_profiles');
+      panel.appendChild(emptyMsg);
       if (_profileMode !== 'create') _clearProfileDetail();
       return;
     }
@@ -3655,6 +4991,28 @@ async function loadProfilesPanel() {
   } catch (e) {
     panel.innerHTML = `<div style="color:var(--accent);font-size:12px;padding:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
   }
+}
+
+function _renderProfileConceptHelp(activeName){
+  const title = $('profileDetailTitle');
+  const body = $('profileDetailBody');
+  const empty = $('profileDetailEmpty');
+  if (!title || !body) return;
+  title.textContent = 'Profiles vs workspaces';
+  body.innerHTML = `
+    <div class="main-view-content">
+      <div class="detail-card">
+        <div class="detail-card-title">Use profiles for how; workspaces for what</div>
+        <div class="detail-row"><div class="detail-row-label">Profiles</div><div class="detail-row-value">Agent identity, memory, skills, model/provider config, and connected tools. Create profiles for roles like researcher, writer, marketer, or developer when those roles should carry different context or capabilities.</div></div>
+        <div class="detail-row"><div class="detail-row-label">Workspaces</div><div class="detail-row-value">Project or product folders on disk. Use one workspace per repo/product so chat, terminal, and file browsing point at the right files.</div></div>
+        <div class="detail-row"><div class="detail-row-label">Together</div><div class="detail-row-value">A profile can have a default workspace, but you can still switch workspaces for a session. Profiles answer “who is working?”; workspaces answer “where are they working?”</div></div>
+      </div>
+    </div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _profileMode = 'read';
+  _currentProfileDetail = null;
+  _setProfileHeaderButtons('empty');
 }
 
 function _renderProfileDetail(p, activeName){
@@ -3750,6 +5108,7 @@ async function deleteCurrentProfile(){
   if(!_ok) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    _invalidateKanbanProfileCache();
     _clearProfileDetail();
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
@@ -3830,6 +5189,7 @@ async function switchToProfile(name) {
   const _chip = $('profileChip');
   const _chipLabel = $('profileChipLabel');
   const _prevProfileName = S.activeProfile || 'default';
+  const _switchGen = ++_profileSwitchGeneration;
   if (_chip) { _chip.classList.add('switching'); _chip.disabled = true; }
   // Optimistic name update — shows the target name right away
   if (_chipLabel) _chipLabel.textContent = name;
@@ -3845,35 +5205,52 @@ async function switchToProfile(name) {
 
   try {
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }) });
+    if (_switchGen !== _profileSwitchGeneration) return;
     S.activeProfile = data.active || name;
 
     // Update composer placeholder and title bar while the core profile-switch
     // state is still close to the profile API response.
     if (typeof applyBotName === 'function') applyBotName();
 
-    // ── Model + Workspace (parallelized) ───────────────────────────────────
-    // populateModelDropdown hits /api/models; loadWorkspaceList hits /api/workspaces.
-    // They are fully independent — run both simultaneously to cut switch time ~50%.
+    // ── Model + Workspace ──────────────────────────────────────────────────
+    // Apply the profile defaults returned by /api/profile/switch immediately.
+    // Refreshing the full model/workspace catalogs is useful, but it should not
+    // hold the visible switch animation open.
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     _skillsData = null;
     _workspaceList = null;
-    await Promise.all([populateModelDropdown(), loadWorkspaceList()]);
+    if (data.default_model) window._defaultModel = data.default_model;
+    if (data.default_model_provider) window._activeProvider = data.default_model_provider;
 
     // ── Apply model ────────────────────────────────────────────────────────
     if (data.default_model) {
       const sel = $('modelSelect');
-      const resolved = _applyModelToDropdown(data.default_model, sel, window._activeProvider||null);
+      const providerId = data.default_model_provider || window._activeProvider || null;
+      const existingDefaultOpt = sel ? Array.from(sel.options).find(o => o.value === data.default_model) : null;
+      if (existingDefaultOpt && providerId && !existingDefaultOpt.dataset.provider) {
+        existingDefaultOpt.dataset.provider = providerId;
+      }
+      if (sel && !existingDefaultOpt) {
+        const opt = document.createElement('option');
+        opt.value = data.default_model;
+        opt.textContent = typeof getModelLabel === 'function' ? getModelLabel(data.default_model) : data.default_model;
+        opt.dataset.custom = '1';
+        if (providerId) opt.dataset.provider = providerId;
+        sel.querySelectorAll('option[data-custom]').forEach(o => o.remove());
+        sel.appendChild(opt);
+      }
+      const resolved = _applyModelToDropdown(data.default_model, sel, providerId);
       const modelToUse = resolved || data.default_model;
       const modelState = (typeof _modelStateForSelect==='function')
         ? _modelStateForSelect(sel, modelToUse)
-        : {model:modelToUse,model_provider:null};
+        : {model:modelToUse,model_provider:providerId};
       S._pendingProfileModel = modelToUse;
-      S._pendingProfileModelProvider = modelState.model_provider||null;
+      S._pendingProfileModelProvider = modelState.model_provider||providerId||null;
       // Only patch the in-memory session model if we're NOT about to replace the session
       if (S.session && !sessionInProgress) {
         S.session.model = modelToUse;
-        S.session.model_provider = modelState.model_provider||null;
+        S.session.model_provider = modelState.model_provider||providerId||null;
       }
     }
 
@@ -3902,23 +5279,14 @@ async function switchToProfile(name) {
 
     // ── Session ────────────────────────────────────────────────────────────
     _showAllProfiles = false;
+    if (typeof animateNextSessionListRefresh === 'function') animateNextSessionListRefresh();
 
     if (sessionInProgress) {
       // The current session has messages and belongs to the previous profile.
       // Start a new session for the new profile so nothing gets cross-tagged.
-      await newSession(false);
-      // Apply profile default workspace to the newly created session (fixes #424)
-      if (S._profileDefaultWorkspace && S.session) {
-        try {
-          await api('/api/session/update', { method: 'POST', body: JSON.stringify({
-            session_id: S.session.session_id,
-            workspace: S._profileDefaultWorkspace,
-            model: S.session.model,
-            model_provider: S.session.model_provider||null,
-          })});
-          S.session.workspace = S._profileDefaultWorkspace;
-        } catch (_) {}
-      }
+      const workspaceVisible = typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed';
+      await newSession(false, {awaitWorkspaceLoad: workspaceVisible});
+      if (_switchGen !== _profileSwitchGeneration) return;
       // Keep topbar chips (workspace/profile) in sync after creating the
       // new profile-scoped session.
       syncTopbar();
@@ -3927,28 +5295,27 @@ async function switchToProfile(name) {
     } else {
       // No messages yet — just refresh the list and topbar in place
       await renderSessionList();
+      if (_switchGen !== _profileSwitchGeneration) return;
       syncTopbar();
       // Refresh workspace file tree so the right panel shows the new
       // profile's workspace, not the previous one (#1214).
-      if (S.session && S.session.workspace) loadDir('.');
+      if (S.session && S.session.workspace) {
+        const dirLoad = loadDir('.');
+        if (typeof _workspacePanelMode !== 'undefined' && _workspacePanelMode !== 'closed') await dirLoad;
+      }
       showToast(t('profile_switched', name));
     }
 
-    // ── Sidebar panels ─────────────────────────────────────────────────────
-    if (_currentPanel === 'skills') await loadSkills();
-    if (_currentPanel === 'memory') await loadMemory();
-    if (_currentPanel === 'tasks') await loadCrons();
-    if (_currentPanel === 'kanban') await loadKanban();
-    if (_currentPanel === 'profiles') await loadProfilesPanel();
-    if (_currentPanel === 'workspaces') await loadWorkspacesPanel();
+    await _profileSwitchPanelLoad();
+    _refreshProfileSwitchBackground(_switchGen);
 
   } catch (e) {
     // Revert the optimistic name update on error
-    if (_chipLabel) _chipLabel.textContent = _prevProfileName;
-    showToast(t('switch_failed') + e.message);
+    if (_switchGen === _profileSwitchGeneration && _chipLabel) _chipLabel.textContent = _prevProfileName;
+    if (_switchGen === _profileSwitchGeneration) showToast(t('switch_failed') + e.message);
   } finally {
     // Always remove loading indicator regardless of success or failure
-    if (_chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
+    if (_switchGen === _profileSwitchGeneration && _chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
   }
 }
 
@@ -3979,6 +5346,11 @@ function _renderProfileForm(){
           </label>
         </div>
         <div class="detail-form-row">
+          <label for="profileFormModel">${esc(t('profile_model_label') || 'Model / provider')}</label>
+          <select id="profileFormModel"></select>
+          <div class="detail-form-hint">${esc(t('profile_model_hint') || 'Choose from configured providers and models for this new profile.')}</div>
+        </div>
+        <div class="detail-form-row">
           <label for="profileFormBaseUrl">${esc(t('profile_base_url_label') || 'Base URL')}</label>
           <input type="text" id="profileFormBaseUrl" placeholder="${esc(t('profile_base_url_placeholder') || 'Optional, e.g. http://localhost:11434')}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
         </div>
@@ -3994,6 +5366,35 @@ function _renderProfileForm(){
   _setProfileHeaderButtons('create');
   const n = $('profileFormName');
   if (n) n.focus();
+  _populateProfileFormModelSelect();
+}
+
+async function _populateProfileFormModelSelect(){
+  const sel = $('profileFormModel');
+  if (!sel) return;
+  sel.innerHTML = `<option value="">${esc(t('profile_model_use_default') || 'Use active profile default')}</option>`;
+  try {
+    const data = await api('/api/models');
+    const groups = (Array.isArray(data && data.groups) && data.groups.length) ? data.groups : [];
+    for (const g of groups) {
+      const og = document.createElement('optgroup');
+      og.label = g.provider || g.provider_id || 'Configured';
+      if (g.provider_id) og.dataset.provider = g.provider_id;
+      for (const m of (Array.isArray(g.models) ? g.models : [])) {
+        if (!m || !m.id) continue;
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label || m.id;
+        og.appendChild(opt);
+      }
+      if (og.children.length) sel.appendChild(og);
+    }
+    if (data && data.default_model && typeof _applyModelToDropdown === 'function') {
+      _applyModelToDropdown(data.default_model, sel, data.active_provider || window._activeProvider || null);
+    }
+  } catch (e) {
+    console.warn('Failed to load profile model picker:', e.message);
+  }
 }
 
 function cancelProfileForm(){
@@ -4010,6 +5411,7 @@ function cancelProfileForm(){
 async function saveProfileForm(){
   const nameEl = $('profileFormName');
   const cloneEl = $('profileFormClone');
+  const modelEl = $('profileFormModel');
   const baseEl = $('profileFormBaseUrl');
   const apiKeyEl = $('profileFormApiKey');
   const errEl = $('profileFormError');
@@ -4024,9 +5426,18 @@ async function saveProfileForm(){
   if (baseUrl && !/^https?:\/\//.test(baseUrl)) { errEl.textContent = t('profile_base_url_rule'); errEl.style.display = ''; return; }
   try {
     const payload = { name, clone_config: cloneConfig };
+    const selectedModel = modelEl ? (modelEl.value || '').trim() : '';
+    if (selectedModel) {
+      const modelState = (typeof _modelStateForSelect === 'function')
+        ? _modelStateForSelect(modelEl, selectedModel)
+        : { model: selectedModel, model_provider: null };
+      if (modelState.model) payload.default_model = modelState.model;
+      if (modelState.model_provider) payload.model_provider = modelState.model_provider;
+    }
     if (baseUrl) payload.base_url = baseUrl;
     if (apiKey) payload.api_key = apiKey;
     await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
+    _invalidateKanbanProfileCache();
     _profilePreFormDetail = null;
     await loadProfilesPanel();
     showToast(t('profile_created', name));
@@ -4047,6 +5458,7 @@ async function deleteProfile(name) {
   if(!_delProf) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    _invalidateKanbanProfileCache();
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
   } catch (e) { showToast(t('delete_failed') + e.message); }
@@ -4058,9 +5470,16 @@ async function loadMemory(force) {
   try {
     const data = await api('/api/memory');
     _memoryData = data;
+    if (_currentMemorySection === 'external_notes' && !data.external_notes_enabled) {
+      _currentMemorySection = null;
+    }
+    if (_currentMemorySection === 'external_notes') {
+      await loadNotesSources(!!force);
+    }
     if (panel) {
       panel.innerHTML = '';
       for (const s of MEMORY_SECTIONS) {
+        if (s.key === 'external_notes' && !_memoryData.external_notes_enabled) continue;
         const el = document.createElement('button');
         el.type = 'button';
         el.className = 'side-menu-item';
@@ -4118,6 +5537,86 @@ let _settingsAppearanceAutosaveTimer = null;
 let _settingsAppearanceAutosaveRetryPayload = null;
 let _settingsPreferencesAutosaveTimer = null;
 let _settingsPreferencesAutosaveRetryPayload = null;
+
+// ── Sidebar tab visibility ─────────────────────────────────────────────────
+const _ALWAYS_VISIBLE_TABS = new Set(['chat','settings']);
+const _HIDDEN_TABS_LS_KEY = 'hermes-webui-hidden-tabs';
+
+function _getHiddenTabs(){
+  try{var h=localStorage.getItem(_HIDDEN_TABS_LS_KEY);if(h){var p=JSON.parse(h);if(Array.isArray(p))return p;}}catch(e){}
+  return[];
+}
+
+function _setHiddenTabs(panels){
+  try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(panels));}catch(e){}
+}
+
+function _applyTabVisibility(hidden){
+  if(!Array.isArray(hidden)) hidden=[];
+  // Hide/unhide all [data-panel] elements (sidebar-nav buttons + rail buttons)
+  document.querySelectorAll('[data-panel]').forEach(function(el){
+    var panel=el.dataset.panel;
+    if(!panel)return;
+    var shouldHide=hidden.indexOf(panel)!==-1;
+    // Never hide always-visible panels (chat, settings) even if present in hidden_tabs
+    if(_ALWAYS_VISIBLE_TABS.has(panel)) shouldHide=false;
+    el.classList.toggle('nav-tab-hidden',shouldHide);
+  });
+  // If the currently active tab is hidden, switch to chat
+  var activeRail=document.querySelector('.rail .rail-btn.nav-tab.active[data-panel]');
+  var activeSidebar=document.querySelector('.sidebar-nav .nav-tab.active[data-panel]');
+  var activeEl=activeRail||activeSidebar;
+  if(activeEl&&activeEl.classList.contains('nav-tab-hidden')){
+    if(typeof switchPanel==='function') switchPanel('chat');
+  }
+}
+
+function _renderTabVisibilityChips(){
+  var container=$('tabVisibilityChips');
+  if(!container)return;
+  var hidden=_getHiddenTabs();
+  // Scan rail buttons to discover all available panels (skip always-visible + dashboard-link)
+  var tabs=document.querySelectorAll('.rail .rail-btn.nav-tab[data-panel]');
+  container.innerHTML='';
+  tabs.forEach(function(tab){
+    var panel=tab.dataset.panel;
+    if(!panel||_ALWAYS_VISIBLE_TABS.has(panel))return;
+    if(tab.classList.contains('dashboard-link'))return;
+    var label=tab.dataset.tooltip||tab.dataset.label||panel;
+    // Capitalize first letter
+    label=label.charAt(0).toUpperCase()+label.slice(1);
+    var chip=document.createElement('button');
+    chip.type='button';
+    chip.className='tab-visibility-chip';
+    var isOff=hidden.indexOf(panel)!==-1;
+    if(isOff)chip.classList.add('chip-off');
+    chip.textContent=label;
+    chip.setAttribute('data-tab-panel',panel);
+    // Use role="switch" + aria-checked instead of aria-pressed so screen
+    // readers narrate "Tasks switch on/off" (matches user mental model) rather
+    // than "Tasks toggle button pressed/not-pressed" (where the polarity is
+    // confusing because chip-off looks like the "off" state).
+    chip.setAttribute('role','switch');
+    chip.setAttribute('aria-checked',isOff?'false':'true');
+    chip.onclick=function(){_toggleTabVisibilityChip(panel);};
+    container.appendChild(chip);
+  });
+}
+
+function _toggleTabVisibilityChip(panel){
+  if(_ALWAYS_VISIBLE_TABS.has(panel))return;
+  var hidden=_getHiddenTabs();
+  var idx=hidden.indexOf(panel);
+  if(idx!==-1){
+    hidden.splice(idx,1);
+  }else{
+    hidden.push(panel);
+  }
+  _setHiddenTabs(hidden);
+  _applyTabVisibility(hidden);
+  _renderTabVisibilityChips();
+  _scheduleAppearanceAutosave();
+}
 
 function switchSettingsSection(name){
   const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
@@ -4244,6 +5743,9 @@ function _appearancePayloadFromUi(){
     theme: ($('settingsTheme')||{}).value || localStorage.getItem('hermes-theme') || 'dark',
     skin: ($('settingsSkin')||{}).value || localStorage.getItem('hermes-skin') || 'default',
     font_size: ($('settingsFontSize')||{}).value || localStorage.getItem('hermes-font-size') || 'default',
+    session_jump_buttons: !!($('settingsSessionJumpButtons')||{}).checked,
+    session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
+    hidden_tabs: _getHiddenTabs(),
   };
 }
 
@@ -4291,6 +5793,11 @@ async function _autosaveAppearanceSettings(payload){
     if(saved&&saved.font_size){
       localStorage.setItem('hermes-font-size',saved.font_size);
     }
+    if(saved){
+      window._sessionJumpButtonsEnabled=!!saved.session_jump_buttons;
+      if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
+    }
+    window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     _setAppearanceAutosaveStatus('saved');
   }catch(e){
     console.warn('[settings] appearance autosave failed', e);
@@ -4314,24 +5821,40 @@ function _preferencesPayloadFromUi(){
   if(langSel) payload.language=langSel.value;
   const showUsageCb=$('settingsShowTokenUsage');
   if(showUsageCb) payload.show_token_usage=showUsageCb.checked;
+  const showQuotaChipCb=$('settingsShowQuotaChip');
+  if(showQuotaChipCb) payload.show_quota_chip=showQuotaChipCb.checked;
+  const hideSuggestionsCb=$('settingsHideSuggestions');
+  if(hideSuggestionsCb) payload.hide_empty_state_suggestions=hideSuggestionsCb.checked;
   const showTpsCb=$('settingsShowTps');
   if(showTpsCb) payload.show_tps=showTpsCb.checked;
+  const fadeTextCb=$('settingsFadeTextEffect');
+  if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const simplifiedToolCb=$('settingsSimplifiedToolCalling');
   if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
   const apiRedactCb=$('settingsApiRedact');
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
   if(showCliCb) payload.show_cli_sessions=showCliCb.checked;
+  const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
+  if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
   if(syncCb) payload.sync_to_insights=syncCb.checked;
   const updateCb=$('settingsCheckUpdates');
   if(updateCb) payload.check_for_updates=updateCb.checked;
+  const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
+  if(ignoreAgentUpdatesCb) payload.ignore_agent_updates=ignoreAgentUpdatesCb.checked;
+  const whatsNewSummaryCb=$('settingsWhatsNewSummary');
+  if(whatsNewSummaryCb) payload.whats_new_summary_enabled=whatsNewSummaryCb.checked;
   const soundCb=$('settingsSoundEnabled');
   if(soundCb) payload.sound_enabled=soundCb.checked;
+  const rtlCb=$('settingsRtl');
+  if(rtlCb) payload.rtl=rtlCb.checked;
   const notifCb=$('settingsNotificationsEnabled');
   if(notifCb) payload.notifications_enabled=notifCb.checked;
   const sidebarDensitySel=$('settingsSidebarDensity');
   if(sidebarDensitySel) payload.sidebar_density=sidebarDensitySel.value;
+  const pinnedLimitField=$('settingsPinnedSessionsLimit');
+  if(pinnedLimitField) payload.pinned_sessions_limit=parseInt(pinnedLimitField.value,10);
   const autoTitleRefreshSel=$('settingsAutoTitleRefresh');
   if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
   const busyInputModeSel=$('settingsBusyInputMode');
@@ -4382,10 +5905,16 @@ async function _autosavePreferencesSettings(payload){
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
       if(typeof renderMessages==='function') renderMessages();
     }
+    if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
+    if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
     if(payload&&payload.show_tps!==undefined){
       window._showTps=!!(saved&&saved.show_tps);
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
       if(typeof renderMessages==='function') renderMessages();
+    }
+    if(payload&&payload.hide_empty_state_suggestions!==undefined){
+      window._hideEmptyStateSuggestions=!!(saved&&saved.hide_empty_state_suggestions);
+      if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -4437,7 +5966,7 @@ async function loadSettingsPanel(){
     const themeVal=settings.theme||'dark';
     if(themeSel) themeSel.value=themeVal;
     if(typeof _syncThemePicker==='function') _syncThemePicker(themeVal);
-    const skinVal=(settings.skin||'default').toLowerCase();
+    const skinVal=(localStorage.getItem('hermes-skin')||settings.skin||'default').toLowerCase();
     const skinSel=$('settingsSkin');
     if(skinSel) skinSel.value=skinVal;
     if(typeof _buildSkinPicker==='function') _buildSkinPicker(skinVal);
@@ -4447,6 +5976,17 @@ async function loadSettingsPanel(){
     const fontSizeSel=$('settingsFontSize');
     if(fontSizeSel) fontSizeSel.value=fontSizeVal;
     if(typeof _syncFontSizePicker==='function') _syncFontSizePicker(fontSizeVal);
+    const jumpButtonsCb=$('settingsSessionJumpButtons');
+    if(jumpButtonsCb){
+      jumpButtonsCb.checked=!!settings.session_jump_buttons;
+      window._sessionJumpButtonsEnabled=jumpButtonsCb.checked;
+      jumpButtonsCb.onchange=function(){
+        window._sessionJumpButtonsEnabled=this.checked;
+        if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
+        _scheduleAppearanceAutosave();
+      };
+    }
+    if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
     // Workspace panel default-open toggle (localStorage-backed)
     // Uses a separate key (hermes-webui-workspace-panel-pref) so that
     // closing the panel via toolbar X does not clear the user's preference.
@@ -4463,6 +6003,27 @@ async function loadSettingsPanel(){
         else if(!open&&_workspacePanelMode!=='closed') toggleWorkspacePanel(false);
       };
     }
+    const endlessScrollCb=$('settingsSessionEndlessScroll');
+    if(endlessScrollCb){
+      endlessScrollCb.checked=!!settings.session_endless_scroll;
+      window._sessionEndlessScrollEnabled=endlessScrollCb.checked;
+      endlessScrollCb.onchange=function(){
+        window._sessionEndlessScrollEnabled=this.checked;
+        _scheduleAppearanceAutosave();
+      };
+    }
+    // Tab visibility chips (dynamically populated from DOM)
+    var hiddenTabs=[];
+    if(Array.isArray(settings.hidden_tabs)){
+      // Server value takes priority — even an empty array means "no tabs hidden"
+      hiddenTabs=settings.hidden_tabs.filter(function(s){return typeof s==='string'&&s.trim();});
+    }else{
+      // Server has no hidden_tabs key — fall back to localStorage
+      hiddenTabs=_getHiddenTabs();
+    }
+    _setHiddenTabs(hiddenTabs);
+    _applyTabVisibility(hiddenTabs);
+    _renderTabVisibilityChips();
     const resolvedLanguage=(typeof resolvePreferredLocale==='function')
       ? resolvePreferredLocale(settings.language, localStorage.getItem('hermes-lang'))
       : (settings.language || localStorage.getItem('hermes-lang') || 'en');
@@ -4508,6 +6069,8 @@ async function loadSettingsPanel(){
       }
       modelSel.addEventListener('change',_markSettingsDirty,{once:false});
     }
+    // Auxiliary models — load task assignments and provider/model options
+    _loadAuxiliaryModels();
     // Send key preference
     const sendKeySel=$('settingsSendKey');
     if(sendKeySel){sendKeySel.value=settings.send_key||'enter';sendKeySel.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -4527,20 +6090,72 @@ async function loadSettingsPanel(){
     }
     const showUsageCb=$('settingsShowTokenUsage');
     if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    // Ambient provider quota chip toggle — default off; only shows at ≥1400px viewport
+    // when enabled (see style.css @media (max-width:1399.98px) rule).
+    const showQuotaChipCb=$('settingsShowQuotaChip');
+    if(showQuotaChipCb){
+      showQuotaChipCb.checked=settings.show_quota_chip===true;
+      window._showQuotaChip=showQuotaChipCb.checked;
+      showQuotaChipCb.addEventListener('change',()=>{
+        window._showQuotaChip=showQuotaChipCb.checked;
+        if(typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
+    const hideSuggestionsCb=$('settingsHideSuggestions');
+    if(hideSuggestionsCb){
+      hideSuggestionsCb.checked=settings.hide_empty_state_suggestions===true;
+      window._hideEmptyStateSuggestions=hideSuggestionsCb.checked;
+      if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
+      hideSuggestionsCb.addEventListener('change',()=>{
+        window._hideEmptyStateSuggestions=hideSuggestionsCb.checked;
+        if(typeof applyEmptyStateSuggestionPref==='function') applyEmptyStateSuggestionPref();
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
     const showTpsCb=$('settingsShowTps');
     if(showTpsCb){showTpsCb.checked=!!settings.show_tps;showTpsCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const pinnedLimitField=$('settingsPinnedSessionsLimit');
+    if(pinnedLimitField){
+      pinnedLimitField.value=parseInt(settings.pinned_sessions_limit||3,10)||3;
+      window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10)||3;
+      pinnedLimitField.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      pinnedLimitField.addEventListener('input',()=>{window._pinnedSessionsLimit=parseInt(pinnedLimitField.value,10)||3;_schedulePreferencesAutosave();},{once:false});
+    }
+    const fadeTextCb=$('settingsFadeTextEffect');
+    if(fadeTextCb){fadeTextCb.checked=!!settings.fade_text_effect;window._fadeTextEffect=fadeTextCb.checked;fadeTextCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const simplifiedToolCb=$('settingsSimplifiedToolCalling');
     if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const apiRedactCb=$('settingsApiRedact');
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
     if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
+    if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const syncCb=$('settingsSyncInsights');
     if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const updateCb=$('settingsCheckUpdates');
     if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
+    if(ignoreAgentUpdatesCb){ignoreAgentUpdatesCb.checked=!!settings.ignore_agent_updates;ignoreAgentUpdatesCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const whatsNewSummaryCb=$('settingsWhatsNewSummary');
+    if(whatsNewSummaryCb){whatsNewSummaryCb.checked=!!settings.whats_new_summary_enabled;whatsNewSummaryCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const soundCb=$('settingsSoundEnabled');
     if(soundCb){soundCb.checked=!!settings.sound_enabled;soundCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    // Right-to-left chat layout (#1721 salvage) — Settings-only, no composer button.
+    const rtlCb=$('settingsRtl');
+    if(rtlCb){
+      const saved=!!settings.rtl || localStorage.getItem('hermes-rtl')==='true';
+      rtlCb.checked=saved;
+      try{localStorage.setItem('hermes-rtl',saved?'true':'false');}catch(_){}
+      document.documentElement.classList.toggle('chat-content-rtl',saved);
+      rtlCb.addEventListener('change',()=>{
+        const on=rtlCb.checked;
+        try{localStorage.setItem('hermes-rtl',on?'true':'false');}catch(_){}
+        document.documentElement.classList.toggle('chat-content-rtl',on);
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
     // TTS settings (localStorage-only, no server round-trip needed)
     const ttsEnabledCb=$('settingsTtsEnabled');
     if(ttsEnabledCb){ttsEnabledCb.checked=localStorage.getItem('hermes-tts-enabled')==='true';ttsEnabledCb.onchange=function(){localStorage.setItem('hermes-tts-enabled',this.checked?'true':'false');_applyTtsEnabled(this.checked);};}
@@ -4631,6 +6246,7 @@ async function loadSettingsPanel(){
     // tells the truth before a user tries (and the backend now also returns
     // 409 as defense-in-depth).
     const pwEnvLocked=!!settings.password_env_var;
+    _settingsPasswordEnvLocked=pwEnvLocked;
     const pwLockBanner=$('settingsPasswordEnvLock');
     if(pwField){
       pwField.disabled=pwEnvLocked;
@@ -4644,7 +6260,9 @@ async function loadSettingsPanel(){
     try{
       const authStatus=await api('/api/auth/status');
       _setSettingsAuthButtonsVisible(!!authStatus.auth_enabled);
+      _syncPasswordlessButton(authStatus);
     }catch(e){}
+    loadPasskeys();
     // #1560: env-var-locked password also disables the Disable Auth button —
     // clearing settings.password_hash is silent no-op when the env var is set,
     // and the backend now returns 409 anyway, so don't offer the action.
@@ -4685,7 +6303,7 @@ async function loadPluginsPanel(){
       list.appendChild(_buildPluginCard(plugin));
     }
   }catch(e){
-    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load plugins: '+esc(e.message||String(e))+'</div>';
+    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">'+t('plugins_load_failed')+esc(e.message||String(e))+'</div>';
   }
 }
 
@@ -4693,24 +6311,46 @@ function _buildPluginCard(plugin){
   const card=document.createElement('div');
   card.className='provider-card plugin-card';
   card.dataset.plugin=(plugin&&plugin.key)||'';
+  // `activation` is the canonical state from /api/plugins (added in #2659).
+  // Fall back to the older `enabled` boolean when the field is missing so
+  // the panel still works against older backends.
+  const activation=(plugin&&typeof plugin.activation==='string')
+    ? plugin.activation
+    : (plugin&&plugin.enabled===false ? 'disabled' : 'enabled');
+  const isProvider=activation==='exclusive'||activation==='provider';
   const hooks=Array.isArray(plugin&&plugin.hooks)?plugin.hooks:[];
+  // Provider plugins (memory/web/browser/etc.) register hooks on their
+  // category's dispatcher, not the four agent-wide visibility hooks the
+  // payload filters to. Show an explanatory line instead of the generic
+  // "No registered lifecycle hooks" when the visibility-hook list is empty.
   const hookHtml=hooks.length
     ? hooks.map(h=>`<span class="plugin-hook-badge">${esc(h)}</span>`).join('')
-    : '<span class="plugin-hook-empty">No registered lifecycle hooks</span>';
-  const version=(plugin&&plugin.version)?` · v${esc(plugin.version)}`:'';
-  const desc=(plugin&&plugin.description)?esc(plugin.description):'No description provided.';
-  const enabled=plugin&&plugin.enabled!==false;
+    : '<span class="plugin-hook-empty">'+t(isProvider?'plugins_provider_no_hooks':'plugins_no_hooks')+'</span>';
+  const version=(plugin&&plugin.version)?' · v'+esc(plugin.version):'';
+  const desc=(plugin&&plugin.description)?esc(plugin.description):t('plugins_no_description');
+  let badgeText;
+  let badgeClass;
+  if(isProvider){
+    badgeText=t('plugins_active_provider');
+    badgeClass='plugin-card-badge-provider';
+  }else if(activation==='enabled'){
+    badgeText=t('plugins_enabled');
+    badgeClass='';
+  }else{
+    badgeText=t('plugins_disabled');
+    badgeClass='plugin-card-badge-disabled';
+  }
   card.innerHTML=`
     <div class="provider-card-header plugin-card-header">
       <div class="provider-card-info">
-        <div class="provider-card-name">${esc((plugin&&plugin.name)||'Unnamed plugin')}</div>
+        <div class="provider-card-name">${esc((plugin&&plugin.name)||t('plugins_unnamed'))}</div>
         <div class="provider-card-meta">${esc((plugin&&plugin.key)||'plugin')}${version}</div>
       </div>
-      <span class="provider-card-badge ${enabled?'':'plugin-card-badge-disabled'}">${enabled?'Enabled':'Disabled'}</span>
+      <span class="provider-card-badge ${badgeClass}">${badgeText}</span>
     </div>
     <div class="provider-card-body plugin-card-body">
       <div class="provider-card-hint">${desc}</div>
-      <div class="provider-card-label">Registered hooks</div>
+      <div class="provider-card-label">${t('plugins_registered_hooks')}</div>
       <div class="plugin-hook-list">${hookHtml}</div>
     </div>
   `;
@@ -4721,14 +6361,21 @@ function _buildPluginCard(plugin){
 
 const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
 
+async function _fetchProviderQuotaStatus(force=false){
+  const endpoint=force?`/api/provider/quota?refresh=1&ts=${Date.now()}`:'/api/provider/quota';
+  const status=await api(endpoint,{cache:'no-store'});
+  if(status&&typeof status==='object') status.client_fetched_at=new Date().toISOString();
+  return status;
+}
+
 async function loadProvidersPanel(){
   const list=$('providersList');
   const empty=$('providersEmpty');
   if(!list) return;
   try{
     const data=await api('/api/providers');
-    const quota=await api('/api/provider/quota').catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable'}));
-    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth);
+    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
+    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom);
     list.innerHTML='';
     _providerCardEls.clear();
     const quotaCard=_buildProviderQuotaCard(quota);
@@ -4744,8 +6391,42 @@ async function loadProvidersPanel(){
       list.appendChild(_buildProviderCard(p));
     }
   }catch(e){
-    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+e.message+'</div>';
+    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+esc(e.message||String(e))+'</div>';
   }
+}
+
+async function _refreshProviderQuota(card,button){
+  if(!card) return;
+  if(button){
+    button.disabled=true;
+    button.textContent=t('provider_quota_refreshing');
+    button.setAttribute('aria-busy','true');
+  }
+  let failed=false;
+  let next;
+  try{
+    next=await _fetchProviderQuotaStatus(true);
+    failed=next&&next.ok===false;
+  }catch(e){
+    failed=true;
+    next={ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()};
+  }
+  try{
+    const fresh=_buildProviderQuotaCard(next);
+    if(fresh){
+      card.replaceWith(fresh);
+      if(typeof showToast==='function') showToast(failed?t('provider_quota_refresh_failed'):t('provider_quota_refresh_succeeded'));
+      return;
+    }
+  }catch(e){
+    failed=true;
+  }
+  if(card.isConnected&&button){
+    button.disabled=false;
+    button.textContent=t('provider_quota_refresh_usage');
+    button.removeAttribute('aria-busy');
+  }
+  if(typeof showToast==='function') showToast(t('provider_quota_refresh_failed'));
 }
 
 function _formatProviderQuotaMoney(value){
@@ -4770,13 +6451,127 @@ function _formatProviderQuotaReset(value){
 }
 
 function _formatProviderQuotaWindowLabel(accountLimits,w){
-  const raw=((w&&w.label)||'Window').trim();
+  const raw=((w&&w.label)||t('provider_quota_window_fallback')).trim();
   const provider=((accountLimits&&accountLimits.provider)||'').toLowerCase();
   if(provider==='openai-codex'){
-    if(raw.toLowerCase()==='session') return '5-hour limit';
-    if(raw.toLowerCase()==='weekly') return 'Weekly limit';
+    if(raw.toLowerCase()==='session') return t('provider_quota_session_limit');
+    if(raw.toLowerCase()==='weekly') return t('provider_quota_weekly_limit');
   }
-  return raw||'Window';
+  return raw||t('provider_quota_window_fallback');
+}
+
+function _formatProviderQuotaLastChecked(status){
+  const accountLimits=status&&status.account_limits;
+  const value=(accountLimits&&accountLimits.fetched_at)||status&&status.client_fetched_at;
+  if(!value) return t('provider_quota_last_checked_after_refresh');
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime())) return t('provider_quota_last_checked_after_refresh');
+  try{return t('provider_quota_last_checked',d.toLocaleString());}catch(e){return t('provider_quota_last_checked',value);}
+}
+
+function _providerQuotaStateClass(value){
+  return String(value||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
+}
+
+function _providerQuotaStatusLabel(value){
+  const state=_providerQuotaStateClass(value);
+  const key={
+    available:'provider_quota_status_available',
+    exhausted:'provider_quota_status_exhausted',
+    unavailable:'provider_quota_status_unavailable',
+    failed:'provider_quota_status_failed',
+    checked:'provider_quota_status_checked',
+    no_key:'provider_quota_status_no_key',
+    invalid_key:'provider_quota_status_invalid_key',
+    unsupported:'provider_quota_status_unsupported',
+  }[state];
+  return key?t(key):state.replace(/_/g,' ');
+}
+
+function _providerQuotaWindowMeta(used,reset){
+  const meta=[];
+  if(used!=='—') meta.push(t('provider_quota_used_meta',used));
+  if(reset) meta.push(t('provider_quota_resets_meta',reset));
+  return meta;
+}
+
+function _providerQuotaRetryAfterText(value){
+  const retry=_formatProviderQuotaReset(value);
+  return retry?t('provider_quota_retry_after',retry):'';
+}
+
+function _providerQuotaUnavailableReason(credential){
+  const structured=_providerQuotaRetryAfterText(credential&&credential.retry_after);
+  if(structured) return structured;
+  const raw=String((credential&&credential.unavailable_reason)||'').trim();
+  const match=raw.match(/\bretry after\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?)/i);
+  if(match){
+    const parsed=_providerQuotaRetryAfterText(match[1]);
+    if(parsed) return parsed;
+  }
+  return raw;
+}
+
+function _providerQuotaPoolShouldDefaultOpen(pool){
+  try{
+    const saved=localStorage.getItem('hermes-provider-quota-pool-open');
+    if(saved==='1') return true;
+    if(saved==='0') return false;
+  }catch(e){}
+  const count=Array.isArray(pool&&pool.credentials)?pool.credentials.length:0;
+  return count>0&&count<=3;
+}
+
+function _buildProviderQuotaPoolBreakdown(accountLimits){
+  const pool=accountLimits&&accountLimits.pool;
+  if(!pool||!Array.isArray(pool.credentials)||pool.credentials.length===0) return '';
+  const defaultOpen=_providerQuotaPoolShouldDefaultOpen(pool);
+  const total=Number.isFinite(Number(pool.total_credentials))?Number(pool.total_credentials):pool.credentials.length;
+  const available=Number.isFinite(Number(pool.available_credentials))?Number(pool.available_credentials):pool.credentials.filter(c=>c&&c.status==='available').length;
+  const exhausted=Number.isFinite(Number(pool.exhausted_credentials))?Number(pool.exhausted_credentials):0;
+  const failed=Number.isFinite(Number(pool.failed_credentials))?Number(pool.failed_credentials):0;
+  const queried=Number.isFinite(Number(pool.queried_credentials))?Number(pool.queried_credentials):0;
+  const summaryParts=[t('provider_quota_pool_summary_available',available,total)];
+  if(exhausted>0) summaryParts.push(t('provider_quota_pool_summary_exhausted',exhausted));
+  if(failed>0) summaryParts.push(t('provider_quota_pool_summary_failed',failed));
+  if(queried>0) summaryParts.push(t('provider_quota_pool_summary_checked',queried));
+  const planParts=Array.isArray(pool.plans)?pool.plans.filter(Boolean):[];
+  const rows=pool.credentials.map((credential,idx)=>{
+    const label=(credential&&credential.label)||t('provider_quota_credential_label',idx+1);
+    const status=_providerQuotaStateClass(credential&&credential.status);
+    const statusText=_providerQuotaStatusLabel(credential&&credential.status);
+    const plan=credential&&credential.plan?` · ${credential.plan}`:'';
+    const windows=Array.isArray(credential&&credential.windows)?credential.windows:[];
+    const details=Array.isArray(credential&&credential.details)?credential.details.filter(Boolean):[];
+    const unavailableReason=_providerQuotaUnavailableReason(credential);
+    const windowHtml=windows.length?windows.map(w=>{
+      const remaining=_formatProviderQuotaPercent(w&&w.remaining_percent);
+      const used=_formatProviderQuotaPercent(w&&w.used_percent);
+      const reset=_formatProviderQuotaReset(w&&w.reset_at);
+      const meta=_providerQuotaWindowMeta(used,reset);
+      const detail=(w&&w.detail)?String(w.detail).trim():'';
+      return `<div class="provider-quota-pool-window"><span>${esc(_formatProviderQuotaWindowLabel(accountLimits,w))}</span><strong>${esc(remaining)}</strong>${meta.length?`<small>${esc(meta.join(' · '))}</small>`:''}${detail?`<small class="provider-quota-window-detail">${esc(detail)}</small>`:''}</div>`;
+    }).join(''):`<div class="provider-quota-pool-note">${esc(unavailableReason||t('provider_quota_pool_no_windows'))}</div>`;
+    const detailHtml=details.length?`<div class="provider-quota-pool-details">${details.map(d=>`<span>${esc(d)}</span>`).join('')}</div>`:'';
+    return `
+      <div class="provider-quota-pool-row provider-quota-pool-row-${status}">
+        <div class="provider-quota-pool-row-head">
+          <span>${esc(label)}${esc(plan)}</span>
+          <strong>${esc(statusText)}</strong>
+        </div>
+        <div class="provider-quota-pool-windows">${windowHtml}</div>
+        ${detailHtml}
+      </div>
+    `;
+  }).join('');
+  const planText=planParts.length?`<div class="provider-quota-pool-plans">${esc(t('provider_quota_pool_plans',planParts.join(', ')))}</div>`:'';
+  return `
+    <details class="provider-quota-pool"${defaultOpen?' open':''}>
+      <summary><span class="provider-quota-pool-summary-label"><span class="provider-quota-pool-chevron" aria-hidden="true"></span><span>${esc(t('provider_quota_credential_pool'))}</span></span><strong>${esc(summaryParts.join(' · '))}</strong></summary>
+      ${planText}
+      <div class="provider-quota-pool-rows">${rows}</div>
+    </details>
+  `;
 }
 
 function _buildProviderQuotaCard(status){
@@ -4785,52 +6580,64 @@ function _buildProviderQuotaCard(status){
   const state=(status.status||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
   card.className='provider-quota-card provider-quota-card-'+state;
   const accountLimits=status.account_limits||null;
-  const providerBase=status.display_name||status.provider||'Active provider';
+  const providerBase=status.display_name||status.provider||t('provider_quota_active_provider');
   const provider=(accountLimits&&accountLimits.plan)?`${providerBase} · ${accountLimits.plan}`:providerBase;
   const quota=status.quota||null;
   let body='';
-  if(status.status==='available'&&accountLimits){
+  if(accountLimits&&(status.status==='available'||accountLimits.pool)){
     const windows=Array.isArray(accountLimits.windows)?accountLimits.windows:[];
-    const details=Array.isArray(accountLimits.details)?accountLimits.details:[];
+    const details=Array.isArray(accountLimits.details)&&!accountLimits.pool?accountLimits.details:[];
     const windowHtml=windows.map(w=>{
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
       const reset=_formatProviderQuotaReset(w&&w.reset_at);
-      const meta=[];
-      if(used!=='—') meta.push(`${used} used`);
-      if(reset) meta.push(`resets ${reset}`);
-      if(w&&w.detail) meta.push(w.detail);
+      const meta=_providerQuotaWindowMeta(used,reset);
+      const detail=(w&&w.detail)?String(w.detail).trim():'';
       return `
         <div class="provider-quota-metric provider-quota-window">
           <span>${esc(_formatProviderQuotaWindowLabel(accountLimits,w))}</span>
           <strong>${esc(_formatProviderQuotaPercent(w&&w.remaining_percent))}</strong>
           ${meta.length?`<small>${esc(meta.join(' · '))}</small>`:''}
+          ${detail?`<small class="provider-quota-window-detail">${esc(detail)}</small>`:''}
         </div>
       `;
     }).join('');
     const detailHtml=details.length
       ? `<div class="provider-quota-details">${details.map(d=>`<span>${esc(d)}</span>`).join('')}</div>`
       : '';
-    body=windowHtml+detailHtml;
-    if(!body) body=`<div class="provider-quota-message">${esc(status.message||'Account limits loaded.')}</div>`;
+    const poolHtml=_buildProviderQuotaPoolBreakdown(accountLimits);
+    body=windowHtml+detailHtml+poolHtml;
+    if(!body) body=`<div class="provider-quota-message">${esc(status.message||t('provider_quota_account_limits_loaded'))}</div>`;
   }else if(status.status==='available'&&quota){
     body=`
-      <div class="provider-quota-metric"><span>Remaining</span><strong>${esc(_formatProviderQuotaMoney(quota.limit_remaining))}</strong></div>
-      <div class="provider-quota-metric"><span>Used</span><strong>${esc(_formatProviderQuotaMoney(quota.usage))}</strong></div>
-      <div class="provider-quota-metric"><span>Limit</span><strong>${esc(_formatProviderQuotaMoney(quota.limit))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_remaining'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.limit_remaining))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_used'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.usage))}</strong></div>
+      <div class="provider-quota-metric"><span>${esc(t('provider_quota_metric_limit'))}</span><strong>${esc(_formatProviderQuotaMoney(quota.limit))}</strong></div>
     `;
   }else{
-    body=`<div class="provider-quota-message">${esc(status.message||'Quota status unavailable')}</div>`;
+    body=`<div class="provider-quota-message">${esc(status.message||t('provider_quota_unavailable'))}</div>`;
   }
   card.innerHTML=`
     <div class="provider-quota-header">
       <div>
-        <div class="provider-quota-title">Active provider quota</div>
+        <div class="provider-quota-title">${esc(t('provider_quota_title'))}</div>
         <div class="provider-quota-subtitle">${esc(provider)}</div>
+        <div class="provider-quota-checked">${esc(_formatProviderQuotaLastChecked(status))}</div>
       </div>
-      <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
+      <div class="provider-quota-actions">
+        <span class="provider-quota-badge">${esc(_providerQuotaStatusLabel(state))}</span>
+        <button class="provider-quota-refresh" type="button" data-provider-quota-refresh title="${esc(t('provider_quota_refresh_title'))}">${esc(t('provider_quota_refresh_usage'))}</button>
+      </div>
     </div>
     <div class="provider-quota-body">${body}</div>
   `;
+  const refreshBtn=card.querySelector('[data-provider-quota-refresh]');
+  if(refreshBtn) refreshBtn.addEventListener('click',()=>_refreshProviderQuota(card,refreshBtn));
+  const poolDetails=card.querySelector('.provider-quota-pool');
+  if(poolDetails){
+    poolDetails.addEventListener('toggle',()=>{
+      try{localStorage.setItem('hermes-provider-quota-pool-open',poolDetails.open?'1':'0');}catch(e){}
+    });
+  }
   return card;
 }
 
@@ -4895,48 +6702,59 @@ function _buildProviderCard(p){
     return card;
   }
 
-  const field=document.createElement('div');
-  field.className='provider-card-field';
-  const label=document.createElement('label');
-  label.className='provider-card-label';
-  label.textContent=t('providers_status_api_key');
-  field.appendChild(label);
+  let input=null;
+  let saveBtn=null;
+  if(p.configurable){
+    const field=document.createElement('div');
+    field.className='provider-card-field';
+    const label=document.createElement('label');
+    label.className='provider-card-label';
+    label.textContent=t('providers_status_api_key');
+    field.appendChild(label);
 
-  const row=document.createElement('div');
-  row.className='provider-card-row';
-  const input=document.createElement('input');
-  input.type='password';
-  input.className='provider-card-input';
-  input.placeholder=p.has_key?t('providers_key_placeholder_replace'):t('providers_key_placeholder_new');
-  input.autocomplete='off';
-  const toggleBtn=document.createElement('button');
-  toggleBtn.type='button';
-  toggleBtn.className='provider-card-btn provider-card-btn-ghost';
-  toggleBtn.textContent='Show';
-  toggleBtn.onclick=()=>{
-    const revealed=input.type==='text';
-    input.type=revealed?'password':'text';
-    toggleBtn.textContent=revealed?'Show':'Hide';
-  };
-  const saveBtn=document.createElement('button');
-  saveBtn.type='button';
-  saveBtn.className='provider-card-btn provider-card-btn-primary';
-  saveBtn.textContent=t('providers_save');
-  saveBtn.onclick=()=>_saveProviderKey(p.id);
-  saveBtn.disabled=true;
-  row.appendChild(input);
-  row.appendChild(toggleBtn);
-  row.appendChild(saveBtn);
-  if(p.has_key){
-    const removeBtn=document.createElement('button');
-    removeBtn.type='button';
-    removeBtn.className='provider-card-btn provider-card-btn-danger';
-    removeBtn.textContent=t('providers_remove');
-    removeBtn.onclick=()=>_removeProviderKey(p.id);
-    row.appendChild(removeBtn);
+    const row=document.createElement('div');
+    row.className='provider-card-row';
+    input=document.createElement('input');
+    input.type='password';
+    input.className='provider-card-input';
+    input.placeholder=p.has_key?t('providers_key_placeholder_replace'):t('providers_key_placeholder_new');
+    input.autocomplete='off';
+    const toggleBtn=document.createElement('button');
+    toggleBtn.type='button';
+    toggleBtn.className='provider-card-btn provider-card-btn-ghost';
+    toggleBtn.textContent='Show';
+    toggleBtn.onclick=()=>{
+      const revealed=input.type==='text';
+      input.type=revealed?'password':'text';
+      toggleBtn.textContent=revealed?'Show':'Hide';
+    };
+    saveBtn=document.createElement('button');
+    saveBtn.type='button';
+    saveBtn.className='provider-card-btn provider-card-btn-primary';
+    saveBtn.textContent=t('providers_save');
+    saveBtn.onclick=()=>_saveProviderKey(p.id);
+    saveBtn.disabled=true;
+    row.appendChild(input);
+    row.appendChild(toggleBtn);
+    row.appendChild(saveBtn);
+    if(p.has_key){
+      const removeBtn=document.createElement('button');
+      removeBtn.type='button';
+      removeBtn.className='provider-card-btn provider-card-btn-danger';
+      removeBtn.textContent=t('providers_remove');
+      removeBtn.onclick=()=>_removeProviderKey(p.id);
+      row.appendChild(removeBtn);
+    }
+    field.appendChild(row);
+    body.appendChild(field);
+  }else{
+    const hint=document.createElement('div');
+    hint.className='provider-card-hint';
+    hint.textContent=p.is_custom
+      ? 'Custom provider loaded from config.yaml / hermes model. Edit it from the CLI or config file.'
+      : 'Provider is managed outside the WebUI.';
+    body.appendChild(hint);
   }
-  field.appendChild(row);
-  body.appendChild(field);
 
   // Model list — show when provider has known models
   if(modelCount>0){
@@ -4990,8 +6808,10 @@ function _buildProviderCard(p){
   body.appendChild(refreshRow);
   card.appendChild(body);
 
-  _providerCardEls.set(p.id,{card,input,saveBtn,hasKey:p.has_key});
-  input.addEventListener('input',()=>{saveBtn.disabled=!input.value.trim();});
+  if(input&&saveBtn){
+    _providerCardEls.set(p.id,{card,input,saveBtn,hasKey:p.has_key});
+    input.addEventListener('input',()=>{saveBtn.disabled=!input.value.trim();});
+  }
   header.addEventListener('click',e=>{
     // Don't toggle when clicking inside body (defensive; body isn't inside header)
     if(e.target.closest('.provider-card-body')) return;
@@ -5070,10 +6890,13 @@ function _refreshModelDropdownsAfterProviderChange(){
     if(typeof window._invalidateSlashModelCache==='function'){
       window._invalidateSlashModelCache();
     }
-    if(typeof populateModelDropdown==='function'){
-      // Fire-and-forget: don't block the providers panel refresh on a
-      // dropdown rebuild. The composer/Settings dropdowns will catch up
-      // on the very next paint frame.
+    // Fire-and-forget: don't block the providers panel refresh on a
+    // dropdown rebuild. The composer/Settings dropdowns will catch up
+    // on the very next paint frame.
+    if(typeof window._ensureModelDropdownReady==='function'){
+      window._modelDropdownReady=null;
+      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
+    }else if(typeof populateModelDropdown==='function'){
       Promise.resolve(populateModelDropdown()).catch(()=>{});
     }
   }catch(_e){
@@ -5100,25 +6923,120 @@ async function _refreshProviderModels(providerId, btn){
   }
 }
 
+let _settingsPasswordEnvLocked=false;
 function _setSettingsAuthButtonsVisible(active){
   const signOutBtn=$('btnSignOut');
   if(signOutBtn) signOutBtn.style.display=active?'':'none';
   const disableBtn=$('btnDisableAuth');
   if(disableBtn) disableBtn.style.display=active?'':'none';
+  const passkeyBtn=$('btnRegisterPasskey');
+  if(passkeyBtn) passkeyBtn.disabled=!active||!window.PublicKeyCredential||!navigator.credentials;
+}
+function _syncPasswordlessButton(authStatus){
+  const btn=$('btnGoPasswordless');
+  if(!btn) return;
+  const can=!!(authStatus&&authStatus.auth_enabled&&authStatus.password_auth_enabled&&authStatus.passkeys_count>0&&!_settingsPasswordEnvLocked);
+  btn.style.display=can?'':'none';
+  btn.disabled=!can;
+}
+
+function _b64uToBytes(s){
+  s=String(s||'').replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4) s+='=';
+  const bin=atob(s), out=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+function _bytesToB64u(buf){
+  const bytes=new Uint8Array(buf);let bin='';
+  for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,'');
+}
+
+async function loadPasskeys(){
+  const list=$('passkeyList');
+  const block=$('passkeysSettingsBlock');
+  if(!list) return;
+  // Stage-batch14: respect the HERMES_WEBUI_PASSKEY feature flag — hide the
+  // whole block when passkey support is disabled at the server level so users
+  // don't see a non-functional "Add passkey" button (clicking it would 404).
+  try{
+    const status=await api('/api/auth/status');
+    if(status && status.passkey_feature_flag === false){
+      if(block) block.style.display='none';
+      return;
+    }
+    if(block) block.style.display='';
+  }catch(_e){
+    // If /api/auth/status fails, keep the block hidden to avoid showing a
+    // broken affordance.
+    if(block) block.style.display='none';
+    return;
+  }
+  if(!window.PublicKeyCredential||!navigator.credentials){
+    list.textContent='Passkeys are not supported by this browser/context.';
+    const btn=$('btnRegisterPasskey'); if(btn) btn.disabled=true;
+    return;
+  }
+  try{
+    const data=await api('/api/auth/passkeys',{method:'POST',body:'{}'});
+    if(data && data.disabled){
+      if(block) block.style.display='none';
+      return;
+    }
+    const creds=(data&&data.credentials)||[];
+    if(!creds.length){list.textContent='No passkeys registered.';return;}
+    list.innerHTML=creds.map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:6px"><span>${esc(c.label||'Passkey')}</span><button class="btn-tiny" onclick="deletePasskey('${esc(c.id)}')">Remove</button></div>`).join('');
+  }catch(e){list.textContent='Failed to load passkeys: '+e.message;}
+}
+
+async function registerPasskey(){
+  if(!window.PublicKeyCredential||!navigator.credentials){showToast('Passkeys require a supported browser and secure context.');return;}
+  const label='This device';
+  try{
+    const optData=await api('/api/auth/passkey/register/options',{method:'POST',body:'{}'});
+    const pk=optData.publicKey;
+    pk.challenge=_b64uToBytes(pk.challenge);
+    pk.user=Object.assign({},pk.user,{id:_b64uToBytes(pk.user.id)});
+    if(Array.isArray(pk.excludeCredentials)) pk.excludeCredentials=pk.excludeCredentials.map(c=>Object.assign({},c,{id:_b64uToBytes(c.id)}));
+    const cred=await navigator.credentials.create({publicKey:pk});
+    if(!cred) throw new Error('Passkey registration cancelled');
+    await api('/api/auth/passkey/register',{method:'POST',body:JSON.stringify({
+      id:cred.id,rawId:_bytesToB64u(cred.rawId),type:cred.type,label,
+      response:{clientDataJSON:_bytesToB64u(cred.response.clientDataJSON),attestationObject:_bytesToB64u(cred.response.attestationObject)}
+    })});
+    showToast('Passkey registered');
+    loadPasskeys();
+    try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}
+  }catch(e){showToast('Passkey registration failed: '+e.message);}
+}
+
+async function deletePasskey(id){
+  const ok=await showConfirmDialog({title:'Remove passkey?',message:'This browser/device will no longer be able to sign in with that passkey.',confirmLabel:'Remove',danger:true,focusCancel:true});
+  if(!ok) return;
+  try{await api('/api/auth/passkey/delete',{method:'POST',body:JSON.stringify({id})});showToast('Passkey removed');loadPasskeys();try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}}
+  catch(e){showToast('Failed to remove passkey: '+e.message);}
 }
 
 function _applySavedSettingsUi(saved, body, opts){
-  const {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
+  const {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
   window._showTokenUsage=showTokenUsage;
+  window._showQuotaChip=showQuotaChip===true;
   window._showTps=showTps;
+  window._fadeTextEffect=!!fadeTextEffect;
   window._showCliSessions=showCliSessions;
+  window._showPreviousMessagingSessions=!!body.show_previous_messaging_sessions;
   window._soundEnabled=body.sound_enabled;
   window._notificationsEnabled=body.notifications_enabled;
+  window._whatsNewSummaryEnabled=!!body.whats_new_summary_enabled;
   window._showThinking=body.show_thinking!==false;
   window._simplifiedToolCalling=body.simplified_tool_calling!==false;
+  window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
+  if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
   window._busyInputMode=body.busy_input_mode||'queue';
+  window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._botName=body.bot_name||'Hermes';
   if(typeof applyBotName==='function') applyBotName();
   if(typeof setLocale==='function') setLocale(language);
@@ -5155,10 +7073,18 @@ async function checkUpdatesNow(){
   if(label) label.textContent=t('settings_checking');
   if(status) status.textContent='';
   try {
-    const data=await api('/api/updates/check?force=1');
+    const data=await api('/api/updates/check?force=1',{timeoutMs:60000});
     if(data.disabled){
       if(status){status.textContent=t('settings_updates_disabled');status.style.color='var(--muted)';}
     } else {
+      const errorParts=[];
+      const formatUpdateError=(typeof _formatUpdateCheckError==='function')
+        ? _formatUpdateCheckError
+        : ((label,info)=>info&&info.error?label:null);
+      const webuiError=formatUpdateError('WebUI',data.webui);
+      const agentError=formatUpdateError('Agent',data.agent);
+      if(webuiError) errorParts.push(webuiError);
+      if(agentError) errorParts.push(agentError);
       const parts=[];
       const formatUpdatePart=(typeof _formatUpdateTargetStatus==='function')
         ? _formatUpdateTargetStatus
@@ -5171,8 +7097,11 @@ async function checkUpdatesNow(){
         if(status){status.textContent=t('settings_updates_available').replace('{count}',parts.join(', '));status.style.color='var(--accent)';}
         // Also trigger the update banner
         if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
+      } else if(errorParts.length){
+        if(status){status.textContent=t('settings_update_check_failed')+': '+errorParts.join(', ');status.style.color='var(--error)';}
       } else {
         if(status){status.textContent=t('settings_up_to_date');status.style.color='var(--success)';}
+        if(typeof _showUpdateBanner==='function') _showUpdateBanner(data);
       }
     }
   } catch(e){
@@ -5194,13 +7123,234 @@ async function checkUpdatesNow(){
   }
 }
 
+// ── Auxiliary Models ──────────────────────────────────────────────────────────
+
+// Canonical auxiliary task slots with display names.
+// Keep in sync with hermes_cli/main.py _AUX_TASKS and hermes_cli/web_server.py _AUX_TASK_SLOTS.
+const _AUX_TASK_SLOTS=[
+ {key:'vision',name:'Vision',desc:'image/screenshot analysis'},
+ {key:'compression',name:'Compression',desc:'context summarization'},
+ {key:'web_extract',name:'Web extract',desc:'web page summarization'},
+ {key:'session_search',name:'Session search',desc:'past-conversation recall'},
+ {key:'approval',name:'Approval',desc:'smart command approval'},
+ {key:'mcp',name:'MCP',desc:'MCP tool reasoning'},
+ {key:'title_generation',name:'Title generation',desc:'session titles'},
+ {key:'skills_hub',name:'Skills hub',desc:'skills search/install'},
+ {key:'curator',name:'Curator',desc:'skill-usage review pass'},
+];
+
+let _auxProviders=[];       // cached provider list from /api/model/options
+let _auxOriginalConfig=null; // snapshot of initial config for dirty detection
+
+function _auxSelectStyle(){
+ return 'width:100%;padding:6px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;box-sizing:border-box';
+}
+
+function _buildAuxProviderOptions(sel,providers,currentProvider){
+ sel.innerHTML='';
+ // "auto" = use main model
+ const autoOpt=document.createElement('option');
+ autoOpt.value='auto';autoOpt.textContent='auto ('+t('settings_aux_provider_auto')+')';
+ if(currentProvider==='auto'||!currentProvider) autoOpt.selected=true;
+ sel.appendChild(autoOpt);
+ for(const p of providers){
+  const opt=document.createElement('option');
+  opt.value=p.slug;opt.textContent=p.name;
+  if(p.slug===currentProvider) opt.selected=true;
+  sel.appendChild(opt);
+ }
+}
+
+function _buildAuxModelOptions(sel,provider,providers,currentModel){
+ sel.innerHTML='';
+ const emptyOpt=document.createElement('option');
+ emptyOpt.value='';emptyOpt.textContent=t('settings_aux_model_auto')||'auto (use provider default)';
+ sel.appendChild(emptyOpt);
+ if(!provider||provider==='auto'){
+  sel.value=currentModel||'';
+  return;
+ }
+ // Find matching provider in cached list
+ const pData=providers.find(p=>p.slug===provider);
+ if(pData&&pData.models){
+  for(const mId of pData.models){
+   const opt=document.createElement('option');
+   opt.value=mId;opt.textContent=mId;
+   if(mId===currentModel) opt.selected=true;
+   sel.appendChild(opt);
+  }
+ }
+ // Always allow custom model — add a text input option hint
+ const customOpt=document.createElement('option');
+ customOpt.value='__custom__';customOpt.textContent=t('settings_aux_model_custom')||'Custom model…';
+ sel.appendChild(customOpt);
+ // If currentModel not in list and not empty, add it as a custom option
+ if(currentModel&&!pData?.models?.includes(currentModel)){
+  const existingOpt=document.createElement('option');
+  existingOpt.value=currentModel;existingOpt.textContent=currentModel+' (configured)';
+  existingOpt.selected=true;
+  sel.insertBefore(existingOpt,customOpt);
+ }
+}
+
+function _onAuxProviderChange(taskKey,providers){
+ const provSel=$('aux-prov-'+taskKey);
+ const modelSel=$('aux-model-'+taskKey);
+ if(!provSel||!modelSel) return;
+ const provider=provSel.value;
+ _buildAuxModelOptions(modelSel,provider,providers,'');
+ _markAuxDirty();
+}
+
+async function _onAuxModelChange(taskKey){
+ const modelSel=$('aux-model-'+taskKey);
+ if(!modelSel) return;
+ if(modelSel.value==='__custom__'){
+  const customModel=await showPromptDialog({title:t('settings_aux_model_custom')||'Custom model',message:t('settings_aux_model_custom_prompt')||'Enter model ID:',placeholder:'model/provider:model-id',confirmLabel:t('settings_btn_apply_aux_models')||'Apply'});
+  if(customModel&&customModel.trim()){
+   // Insert custom model option before the __custom__ option
+   const opt=document.createElement('option');
+   opt.value=customModel.trim();opt.textContent=customModel.trim();
+   // Remove __custom__ selection
+   const customIdx=[...modelSel.options].findIndex(o=>o.value==='__custom__');
+   if(customIdx>=0) modelSel.insertBefore(opt,modelSel.options[customIdx]);
+   modelSel.value=customModel.trim();
+  }else{
+   modelSel.value='';
+  }
+ }
+ _markAuxDirty();
+}
+
+function _markAuxDirty(){
+ const applyBtn=$('btnApplyAuxModels');
+ if(applyBtn) applyBtn.style.display='';
+ _markSettingsDirty();
+}
+
+async function _loadAuxiliaryModels(){
+ const container=$('auxModelsContainer');
+ if(!container) return;
+ container.innerHTML='<div style="color:var(--muted);font-size:12px">'+(t('settings_aux_loading')||'Loading…')+'</div>';
+
+ try{
+ // Fetch auxiliary config AND the WebUI's own /api/models for provider/model lists
+ const [auxData,modelsData]=await Promise.all([
+ api('/api/model/auxiliary').catch(()=>null),
+ api('/api/models').catch(()=>null),
+ ]);
+ // Build provider list from /api/models groups
+ // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
+ const groups=(modelsData&&modelsData.groups)||[];
+ _auxProviders=groups.filter(g=>g.provider&&g.models&&g.models.length>0).map(g=>({
+ slug:g.provider_id||g.provider,
+ name:g.provider,
+ models:g.models.map(m=>m.id),
+ }));
+ const tasks=(auxData&&auxData.tasks)||[];
+  // Build a quick lookup: taskKey → {provider, model}
+  const taskMap={};
+  for(const t of tasks) taskMap[t.task]=t;
+  _auxOriginalConfig=JSON.parse(JSON.stringify(taskMap));
+
+  container.innerHTML='';
+  for(const slot of _AUX_TASK_SLOTS){
+   const cfg=taskMap[slot.key]||{provider:'auto',model:''};
+   const row=document.createElement('div');
+   row.style.cssText='display:grid;grid-template-columns:120px 1fr 1fr;gap:8px;align-items:center;margin-bottom:8px';
+
+   // Task name + description
+   const label=document.createElement('div');
+   label.style.cssText='font-size:12px;font-weight:500;color:var(--text);line-height:1.3';
+   label.innerHTML=esc(slot.name)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(slot.desc)+'</div>';
+   row.appendChild(label);
+
+   // Provider select
+   const provSel=document.createElement('select');
+   provSel.id='aux-prov-'+slot.key;
+   provSel.style.cssText=_auxSelectStyle();
+   _buildAuxProviderOptions(provSel,_auxProviders,cfg.provider);
+   provSel.addEventListener('change',()=>_onAuxProviderChange(slot.key,_auxProviders));
+   row.appendChild(provSel);
+
+   // Model select
+   const modelSel=document.createElement('select');
+   modelSel.id='aux-model-'+slot.key;
+   modelSel.style.cssText=_auxSelectStyle();
+   _buildAuxModelOptions(modelSel,cfg.provider,_auxProviders,cfg.model);
+   modelSel.addEventListener('change',()=>_onAuxModelChange(slot.key));
+   row.appendChild(modelSel);
+
+   container.appendChild(row);
+  }
+  // Hide apply button (no changes yet)
+  const applyBtn=$('btnApplyAuxModels');
+  if(applyBtn) applyBtn.style.display='none';
+
+  // Reset button
+  const resetBtn=$('btnResetAuxModels');
+  if(resetBtn&&!resetBtn._bound){
+   resetBtn._bound=true;
+   resetBtn.addEventListener('click',async()=>{
+    if(!(await showConfirmDialog({title:t('settings_aux_reset_confirm_title')||'Reset auxiliary models?',message:t('settings_aux_reset_confirm_msg')||'This will set all auxiliary tasks to auto (use main model).',confirmLabel:t('settings_btn_reset_aux_models')||'Reset',danger:true}))) return;
+    try{
+     await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:'__reset__',provider:'auto',model:''})});
+     if(typeof showToast==='function') showToast(t('settings_aux_reset_done')||'Auxiliary models reset to auto');
+     _loadAuxiliaryModels();
+    }catch(e){
+     if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to reset auxiliary models');
+    }
+   });
+  }
+
+  // Apply button
+  if(applyBtn&&!applyBtn._bound){
+   applyBtn._bound=true;
+   applyBtn.addEventListener('click',_applyAuxModels);
+  }
+ }catch(e){
+  console.warn('[settings] auxiliary models load failed',e);
+  container.innerHTML='<div style="color:var(--muted);font-size:12px">'+(t('settings_aux_load_failed')||'Could not load auxiliary model settings. Make sure the agent API is available.')+'</div>';
+ }
+}
+
+async function _applyAuxModels(){
+ let saved=0;
+ for(const slot of _AUX_TASK_SLOTS){
+  const provSel=$('aux-prov-'+slot.key);
+  const modelSel=$('aux-model-'+slot.key);
+  if(!provSel) continue;
+  const provider=provSel.value;
+  const model=(modelSel&&modelSel.value!=='__custom__')?(modelSel.value||''):'';
+  const orig=_auxOriginalConfig?.[slot.key]||{provider:'auto',model:''};
+  // Only save if changed
+  if(provider!==orig.provider||model!==orig.model){
+   try{
+    await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:slot.key,provider,model})});
+    saved++;
+   }catch(e){
+    console.warn('[settings] failed to save aux task',slot.key,e);
+    if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to save auxiliary model for '+slot.name);
+    return;
+   }
+  }
+ }
+ if(typeof showToast==='function') showToast(saved?(t('settings_aux_saved')||'Auxiliary models updated'):(t('settings_aux_no_changes')||'No changes to apply'));
+ // Reload to refresh state
+ _loadAuxiliaryModels();
+}
+
 async function saveSettings(andClose){
   const model=($('settingsModel')||{}).value;
   const modelChanged=(model||'')!==(_settingsHermesDefaultModelOnOpen||'');
   const sendKey=($('settingsSendKey')||{}).value;
   const showTokenUsage=!!($('settingsShowTokenUsage')||{}).checked;
+  const showQuotaChip=!!($('settingsShowQuotaChip')||{}).checked;
   const showTps=!!($('settingsShowTps')||{}).checked;
+  const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
+  const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
+  const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
   const pw=($('settingsPassword')||{}).value;
   const theme=($('settingsTheme')||{}).value||'dark';
   const skin=($('settingsSkin')||{}).value||'default';
@@ -5214,15 +7364,24 @@ async function saveSettings(andClose){
   body.theme=theme;
   body.skin=skin;
   body.font_size=fontSize;
+  body.session_jump_buttons=!!($('settingsSessionJumpButtons')||{}).checked;
+  body.session_endless_scroll=!!($('settingsSessionEndlessScroll')||{}).checked;
   body.language=language;
   body.show_token_usage=showTokenUsage;
+  body.show_quota_chip=showQuotaChip===true;
   body.show_tps=showTps;
+  body.fade_text_effect=fadeTextEffect;
   body.simplified_tool_calling=!!($('settingsSimplifiedToolCalling')||{}).checked;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
+  body.show_previous_messaging_sessions=showPreviousMessagingSessions;
+  body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
   body.check_for_updates=!!($('settingsCheckUpdates')||{}).checked;
+  body.ignore_agent_updates=!!($('settingsIgnoreAgentUpdates')||{}).checked;
+  body.whats_new_summary_enabled=!!($('settingsWhatsNewSummary')||{}).checked;
   body.sound_enabled=!!($('settingsSoundEnabled')||{}).checked;
+  body.rtl=!!($('settingsRtl')||{}).checked;
   body.notifications_enabled=!!($('settingsNotificationsEnabled')||{}).checked;
   body.show_thinking=window._showThinking!==false;
   body.sidebar_density=sidebarDensity;
@@ -5242,7 +7401,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
-      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       _settingsDirty=false;
       _resetSettingsPanelState();
@@ -5261,7 +7420,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
-    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showTps,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
     showToast(t('settings_saved'));
     _settingsDirty=false;
     _resetSettingsPanelState();
@@ -5281,17 +7440,31 @@ async function signOut(){
   }
 }
 
+async function goPasswordless(){
+  const ok=await showConfirmDialog({title:'Go passwordless?',message:'This removes the password and keeps passkey sign-in enabled. Keep at least one passkey registered or you could lose access.',confirmLabel:'Go passwordless',danger:false,focusCancel:true});
+  if(!ok) return;
+  try{
+    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify({_passwordless:true})});
+    showToast('Password removed. Passkey sign-in remains enabled.');
+    _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
+    _syncPasswordlessButton({auth_enabled:saved.auth_enabled,password_auth_enabled:false,passkeys_count:1});
+    const pwField=$('settingsPassword'); if(pwField) pwField.value='';
+  }catch(e){showToast('Failed to go passwordless: '+e.message);}
+}
+
 async function disableAuth(){
   const _disAuth=await showConfirmDialog({title:t('disable_auth_confirm_title'),message:t('disable_auth_confirm_message'),confirmLabel:t('disable'),danger:true,focusCancel:true});
   if(!_disAuth) return;
   try{
     await api('/api/settings',{method:'POST',body:JSON.stringify({_clear_password:true})});
     showToast(t('auth_disabled'));
-    // Hide both auth buttons since auth is now off
+    // Hide auth controls since auth is now off
     const disableBtn=$('btnDisableAuth');
     if(disableBtn) disableBtn.style.display='none';
     const signOutBtn=$('btnSignOut');
     if(signOutBtn) signOutBtn.style.display='none';
+    _syncPasswordlessButton({auth_enabled:false,password_auth_enabled:false,passkeys_count:0});
+    loadPasskeys();
   }catch(e){
     showToast(t('disable_auth_failed')+e.message);
   }
@@ -5319,7 +7492,9 @@ function startCronPolling(){
       const data=await api(`/api/crons/recent?since=${_cronPollSince}`);
       if(data.completions&&data.completions.length>0){
         for(const c of data.completions){
-          showToast(t('cron_completion_status', c.name, c.status==='error' ? t('status_failed') : t('status_completed')),4000);
+          if(c.toast_notifications !== false){
+            showToast(t('cron_completion_status', c.name, c.status==='error' ? t('status_failed') : t('status_completed')),4000);
+          }
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
           if(c.job_id) _cronNewJobIds.add(String(c.job_id));
         }
@@ -5359,7 +7534,7 @@ function _clearCronUnreadForJob(jobId){
 }
 
 const _origSwitchPanel=switchPanel;
-switchPanel=async function(name){ return _origSwitchPanel(name); };
+switchPanel=async function(name,opts){ return _origSwitchPanel(name,opts); };
 
 // Start polling on page load
 startCronPolling();
@@ -5421,6 +7596,16 @@ function _mcpStatusLabel(status){
   }[status]||'mcp_status_unknown';
   return t(key);
 }
+function toggleMcpServer(name, enabled){
+  api('/api/mcp/servers/'+encodeURIComponent(name),{
+    method:'PATCH',
+    body:JSON.stringify({enabled:enabled}),
+  }).then(r=>{
+    if(r&&r.ok) showToast(t(enabled?'mcp_enabled_toast':'mcp_disabled_toast',name));
+    else showToast(t('mcp_toggle_failed'),'error');
+    loadMcpServers();
+  }).catch(()=>{showToast(t('mcp_toggle_failed'),'error');loadMcpServers();});
+}
 function loadMcpServers(){
   const list=$('mcpServerList');
   if(!list) return;
@@ -5431,7 +7616,6 @@ function loadMcpServers(){
       list.innerHTML=`<div class="mcp-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('mcp_no_servers'))}</div>`;
       return;
     }
-    const toggleNote=r.toggle_supported?'':'<div class="mcp-readonly-note">'+esc(t('mcp_toggle_followup'))+'</div>';
     list.innerHTML=r.servers.map(s=>{
       const transportLabel=s.transport==='http'?'HTTP':s.transport==='stdio'?'stdio':(''+(s.transport||'unknown'));
       const transportClass=s.transport==='http'?'mcp-http':s.transport==='stdio'?'mcp-stdio':'mcp-unknown';
@@ -5445,6 +7629,11 @@ function loadMcpServers(){
       const envInfo=s.env?Object.entries(s.env).map(([k,v])=>`${k}=${v}`).join(', '):'';
       const headersInfo=s.headers?Object.entries(s.headers).map(([k,v])=>`${k}=${v}`).join(', '):'';
       const secretInfo=[envInfo,headersInfo].filter(Boolean).join(' | ');
+      const isEnabled=s.enabled!==false;
+      const encodedName=encodeURIComponent(s.name).replace(/'/g,"\\'");
+      const toggleBtn=r.toggle_supported
+        ?`<button type="button" class="mcp-toggle-btn ${isEnabled?'mcp-toggle-enabled':'mcp-toggle-disabled'}" title="${esc(t(isEnabled?'mcp_disable_server':'mcp_enable_server'))}" onclick="toggleMcpServer('${encodedName}',${!isEnabled})">${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</button>`
+        :`<span>${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</span>`;
       return `<div class="mcp-server-row">
         <div class="mcp-server-row-head">
           <span class="mcp-server-name">${esc(s.name)}</span>
@@ -5452,12 +7641,16 @@ function loadMcpServers(){
           ${statusBadge}
         </div>
         <div class="mcp-server-detail">${esc(detail)}${secretInfo?' | '+esc(secretInfo):''}</div>
-        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span><span>${esc(t(s.enabled===false?'mcp_enabled_no':'mcp_enabled_yes'))}</span></div>
+        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span>${toggleBtn}</div>
       </div>`;
-    }).join('')+toggleNote;
+    }).join('');
   }).catch(()=>{list.innerHTML=`<div class="mcp-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_load_failed'))}</div>`});
 }
 let _mcpToolsCache=[];
+let _mcpToolsMeta={};
+let _mcpToolsPage=1;
+let _mcpToolsPageSize=5;
+const MCP_TOOLS_PAGE_SIZE_OPTIONS=[5,10,20,40];
 function _filterMcpToolsForSearch(tools, query){
   const q=(query||'').trim().toLowerCase();
   if(!q) return Array.isArray(tools)?tools:[];
@@ -5474,16 +7667,56 @@ function _mcpToolSchemaText(schemaSummary){
     return `${p.name}${req}: ${p.type||'unknown'}${desc}`;
   }).join('\n');
 }
-function _renderMcpTools(tools, query){
-  const list=$('mcpToolList');
-  if(!list) return;
-  const filtered=_filterMcpToolsForSearch(tools, query);
-  if(!filtered.length){
-    const key=query?'mcp_tools_no_matches':'mcp_tools_no_tools';
-    list.innerHTML=`<div class="mcp-tool-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t(key))}</div>`;
+function _mcpToolsSummary(total, filtered, page, pages, query){
+  const trimmedQuery=(query||'').trim();
+  if(!filtered){
+    if(trimmedQuery) return t('mcp_tools_summary_no_matches',trimmedQuery,total);
+    return total?t('mcp_tools_summary_none'):'';
+  }
+  const pageSize=_mcpToolsPageSize||5;
+  const start=(page-1)*pageSize+1;
+  const end=Math.min(filtered,page*pageSize);
+  const searchNote=trimmedQuery?t('mcp_tools_summary_matching',trimmedQuery):'';
+  const totalNote=filtered===total?'':t('mcp_tools_summary_total_note',total);
+  return t('mcp_tools_summary_showing',start,end,filtered,searchNote,totalNote,page,pages);
+}
+function _mcpToolPageSizeControl(){
+  const options=MCP_TOOLS_PAGE_SIZE_OPTIONS.map(size=>`<option value="${size}" ${size===_mcpToolsPageSize?'selected':''}>${size}</option>`).join('');
+  return `<label class="mcp-tool-page-size">${esc(t('mcp_tools_page_size_prefix'))} <select aria-label="${esc(t('mcp_tools_per_page_aria'))}" onchange="setMcpToolsPageSize(this.value)">${options}</select> ${esc(t('mcp_tools_page_size_suffix'))}</label>`;
+}
+function _mcpToolsEmptyMessage(query){
+  const base=esc(t(query?'mcp_tools_no_matches':'mcp_tools_no_tools'));
+  const unavailable=Array.isArray(_mcpToolsMeta.unavailable_servers)?_mcpToolsMeta.unavailable_servers:[];
+  if(query||!unavailable.length) return base;
+  return `${base}<br><span class="mcp-tool-empty-detail">${esc(t('mcp_tools_inactive_configured_servers',unavailable.join(', ')))}</span>`;
+}
+function _renderMcpToolPager(filteredCount, page, pages){
+  const pager=$('mcpToolPager');
+  if(!pager) return;
+  if(pages<=1){
+    pager.innerHTML='';
     return;
   }
-  list.innerHTML=filtered.map(tool=>{
+  pager.innerHTML=`<button type="button" class="mcp-tool-page-btn" onclick="setMcpToolsPage(${page-1})" ${page<=1?'disabled':''} aria-label="${esc(t('mcp_tools_previous_page_aria'))}">${esc(t('mcp_tools_previous_page'))}</button>
+    <span class="mcp-tool-page-label">${page} / ${pages}</span>
+    <button type="button" class="mcp-tool-page-btn" onclick="setMcpToolsPage(${page+1})" ${page>=pages?'disabled':''} aria-label="${esc(t('mcp_tools_next_page_aria'))}">${esc(t('mcp_tools_next_page'))}</button>`;
+}
+function _renderMcpTools(tools, query){
+  const list=$('mcpToolList');
+  const toolbar=$('mcpToolToolbar');
+  if(!list) return;
+  const filtered=_filterMcpToolsForSearch(tools, query);
+  const total=Array.isArray(tools)?tools.length:0;
+  const pages=Math.max(1,Math.ceil(filtered.length/_mcpToolsPageSize));
+  _mcpToolsPage=Math.min(Math.max(1,_mcpToolsPage||1),pages);
+  if(toolbar) toolbar.innerHTML=`<span class="mcp-tool-summary">${esc(_mcpToolsSummary(total,filtered.length,_mcpToolsPage,pages,query))}</span>${_mcpToolPageSizeControl()}`;
+  _renderMcpToolPager(filtered.length,_mcpToolsPage,pages);
+  if(!filtered.length){
+    list.innerHTML=`<div class="mcp-tool-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${_mcpToolsEmptyMessage(query)}</div>`;
+    return;
+  }
+  const visible=filtered.slice((_mcpToolsPage-1)*_mcpToolsPageSize,_mcpToolsPage*_mcpToolsPageSize);
+  list.innerHTML=visible.map(tool=>{
     const status=tool.status||'unknown';
     const statusBadge=`<span class="mcp-status-badge mcp-status-${esc(status)}">${esc(_mcpStatusLabel(status))}</span>`;
     const schemaText=_mcpToolSchemaText(tool.schema_summary);
@@ -5498,16 +7731,42 @@ function _renderMcpTools(tools, query){
     </div>`;
   }).join('');
 }
-function filterMcpTools(){
+function setMcpToolsPage(page){
+  _mcpToolsPage=page;
   const input=$('mcpToolSearch');
   _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
+}
+function setMcpToolsPageSize(size){
+  const next=Number(size);
+  if(!MCP_TOOLS_PAGE_SIZE_OPTIONS.includes(next)) return;
+  _mcpToolsPageSize=next;
+  _mcpToolsPage=1;
+  const input=$('mcpToolSearch');
+  _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
+}
+function filterMcpTools(){
+  _mcpToolsPage=1;
+  const input=$('mcpToolSearch');
+  _renderMcpTools(_mcpToolsCache,input?input.value:'');
+  const list=$('mcpToolList');
+  if(list) list.scrollTop=0;
 }
 function loadMcpTools(){
   const list=$('mcpToolList');
+  const toolbar=$('mcpToolToolbar');
+  const pager=$('mcpToolPager');
   if(!list) return;
+  if(toolbar) toolbar.textContent='';
+  if(pager) pager.innerHTML='';
   list.innerHTML=`<div style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('loading'))}</div>`;
   api('/api/mcp/tools').then(r=>{
     _mcpToolsCache=(r&&Array.isArray(r.tools))?r.tools:[];
+    _mcpToolsMeta=r||{};
+    _mcpToolsPage=1;
     filterMcpTools();
   }).catch(()=>{list.innerHTML=`<div class="mcp-tool-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_tools_load_failed'))}</div>`});
 }

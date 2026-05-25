@@ -418,6 +418,53 @@ class TestDoneEventSmd:
             "before renderMessages() in the 'done' handler source"
         )
 
+    def test_done_handler_preserves_bottom_follow_on_final_render(self):
+        """Final DOM replacement must keep auto-following users at the bottom.
+
+        The live stream path can be visually at bottom while _scrollPinned was
+        knocked false by history/windowing/layout preservation. On `done`, the
+        live DOM is replaced with persisted messages; if the handler blindly calls
+        renderMessages({preserveScroll:true}) while the pin flag is false, the
+        transcript can jump to the top. Capture bottom/follow intent before the
+        replacement and explicitly bottom only for those users.
+        """
+        fn = self.get_fn()
+        assert fn, "'done' handler not found"
+        assert "shouldFollowOnDone" in fn, (
+            "'done' handler must capture whether the viewed transcript should "
+            "continue following before replacing the live DOM."
+        )
+        follow_idx = fn.index("shouldFollowOnDone")
+        render_idx = fn.index("renderMessages({preserveScroll:true})")
+        assert follow_idx < render_idx, (
+            "Follow intent must be captured before renderMessages() replaces the "
+            "live transcript DOM."
+        )
+        after_render = fn[render_idx:render_idx + 500]
+        assert "if(shouldFollowOnDone" in after_render and "scrollToBottom()" in after_render, (
+            "After final render, done handler must call scrollToBottom() when the "
+            "user was pinned/near-bottom before DOM replacement."
+        )
+        assert "_isMessagePaneNearBottom" in fn, (
+            "Done follow capture must include a near-bottom DOM check, not only "
+            "the possibly-stale _scrollPinned flag."
+        )
+
+    def test_done_handler_prefers_message_tool_metadata_for_settled_render(self):
+        """If final messages already contain tool metadata, renderMessages()
+        should derive anchored settled cards from those messages.
+
+        Falling back to session-level tool_calls unconditionally can hide cards
+        after pagination/windowing because those anchors may not line up with
+        the active message array.
+        """
+        fn = self.get_fn()
+        assert fn, "'done' handler not found"
+        done_before_render = fn[:fn.index("renderMessages({preserveScroll:true})")]
+        assert "const hasMessageToolMetadata=S.messages.some" in done_before_render
+        assert "!hasMessageToolMetadata&&d.session.tool_calls&&d.session.tool_calls.length" in done_before_render
+        assert "S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map" in done_before_render
+
 
 # ── 7. apperror event: smd parser ends cleanly ───────────────────────────────
 
@@ -522,7 +569,8 @@ class TestSmdUrlSchemeSanitization:
     def test_sanitize_uses_scheme_allowlist(self):
         # The allowlist regex must permit the safe schemes that the legacy
         # renderMd path emitted (http/https + relative/anchor paths + mailto/tel)
-        # and reject everything else — including javascript:, data:, vbscript:, file:.
+        # and reject dangerous executable schemes. file:// anchors are rewritten
+        # to api/media before click time rather than allowed through raw.
         assert "_SMD_SAFE_URL_RE" in MESSAGES_JS, (
             "Expected a _SMD_SAFE_URL_RE regex defining the safe-scheme allowlist"
         )
@@ -533,10 +581,16 @@ class TestSmdUrlSchemeSanitization:
         pattern = m.group(1)
         # Must mention https? and must NOT mention javascript/vbscript/data
         assert "https?" in pattern, "allowlist must permit https?:"
+        assert "file:" not in pattern, "raw file: anchors must be rewritten, not allowed through"
+        assert "api" in MESSAGES_JS, "allowlist must permit rewritten api/media anchors"
         for bad in ("javascript", "vbscript", "data:"):
             assert bad not in pattern, (
                 f"allowlist must NOT mention {bad!r} — schemes are denied by default"
             )
+
+    def test_file_anchor_rewrite_helper_exists(self):
+        assert "_smdFileHref" in MESSAGES_JS
+        assert "api/media?path=" in MESSAGES_JS
 
     def test_sanitize_called_after_smd_write(self):
         # _smdWrite must invoke _sanitizeSmdLinks on assistantBody after feeding the parser,

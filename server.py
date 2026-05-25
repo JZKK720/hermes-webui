@@ -4,11 +4,104 @@ Thin routing shell: imports Handler, delegates to api/routes.py, runs server.
 All business logic lives in api/*.
 """
 import logging
+import os
 import socket
 import sys
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ── Test-mode network isolation ─────────────────────────────────────────────
+# When `HERMES_WEBUI_TEST_NETWORK_BLOCK=1` is set in the environment, refuse
+# outbound socket connections to anything that is not loopback / RFC1918 /
+# link-local / reserved-TLD. This catches accidental real outbound (forgotten
+# mocks, leaked credentials triggering SDK init, new code paths bypassing an
+# existing mock) so the test suite stays hermetic and fast.
+#
+# tests/conftest.py sets this env var on every test_server subprocess so the
+# server.py-side network isolation matches the pytest-process-side isolation
+# already installed there.
+#
+# A test that legitimately needs real outbound spawns the server with the env
+# var unset (no current callers — every test_server-using test should be
+# mockable).
+if os.environ.get("HERMES_WEBUI_TEST_NETWORK_BLOCK", "").strip() in ("1", "true", "yes"):
+    _REAL_CREATE_CONN = socket.create_connection
+    _REAL_SOCK_CONNECT = socket.socket.connect
+
+    import re as _re
+
+    def _re_match_unique_local_ipv6(h):
+        """Match IPv6 fc00::/7 (canonical syntax). Tighter than startswith('fc')
+        so we don't mistakenly classify hostnames like 'food.example.com' as local."""
+        return bool(_re.match(r"^f[cd][0-9a-f]{0,2}:", h))
+
+    def _addr_is_local(host):
+        if not isinstance(host, str):
+            return False
+        h = host.strip().lower()
+        if not h:
+            return False
+        # IPv6 unique-local fc00::/7: require hex pair + colon to avoid
+        # matching hostnames like "food.example.com" or "fdsa.test".
+        if h in ("::1", "0:0:0:0:0:0:0:1") or h.startswith("fe80:") or _re_match_unique_local_ipv6(h):
+            return True
+        if h == "localhost" or h.endswith(".localhost"):
+            return True
+        if h.endswith(".local") or h.endswith(".test") or h.endswith(".invalid"):
+            return True
+        if h == "example.com" or h.endswith(".example.com"):
+            return True
+        if h == "example.net" or h.endswith(".example.net"):
+            return True
+        if h == "example.org" or h.endswith(".example.org"):
+            return True
+        if h.endswith(".example"):
+            return True
+        if h and h[0].isdigit() and h.count(".") == 3:
+            try:
+                o1, o2, o3, o4 = [int(p) for p in h.split(".")]
+            except ValueError:
+                return False
+            if o1 == 127:
+                return True
+            if o1 == 10:
+                return True
+            if o1 == 192 and o2 == 168:
+                return True
+            if o1 == 172 and 16 <= o2 <= 31:
+                return True
+            if o1 == 169 and o2 == 254:
+                return True
+            if o1 == 203 and o2 == 0 and o3 == 113:
+                return True
+        return False
+
+    def _blocked_create_connection(address, *a, **kw):
+        try:
+            host = address[0]
+        except (TypeError, IndexError):
+            host = ""
+        if _addr_is_local(host):
+            return _REAL_CREATE_CONN(address, *a, **kw)
+        raise OSError(
+            f"hermes test network isolation (server.py): outbound to {address!r} blocked"
+        )
+
+    def _blocked_socket_connect(self, address):
+        try:
+            host = address[0]
+        except (TypeError, IndexError):
+            host = ""
+        if _addr_is_local(host):
+            return _REAL_SOCK_CONNECT(self, address)
+        raise OSError(
+            f"hermes test network isolation (server.py): socket.connect to {address!r} blocked"
+        )
+
+    socket.create_connection = _blocked_create_connection
+    socket.socket.connect = _blocked_socket_connect
+
 
 try:
     import resource
@@ -22,7 +115,7 @@ from api.auth import check_auth
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
 from api.helpers import j, get_profile_cookie
 from api.profiles import set_request_profile, clear_request_profile
-from api.routes import handle_delete, handle_get, handle_patch, handle_post
+from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 
@@ -77,6 +170,13 @@ class QuietHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 enables keep-alive connection reuse — major latency win on
+    # high-RTT links where every saved TCP handshake is 2×RTT. Each response
+    # MUST declare framing (Content-Length, Transfer-Encoding: chunked, or
+    # Connection: close) so the client knows where the message ends. Helpers
+    # j()/t() emit Content-Length; SSE/streaming endpoints emit
+    # Connection: close because the body has no terminator. See PR notes.
+    protocol_version = "HTTP/1.1"
     timeout = 30  # seconds — kills idle/incomplete connections to prevent thread exhaustion
     
     def setup(self):
@@ -107,6 +207,30 @@ class Handler(BaseHTTPRequestHandler):
                 pass
     _ver_suffix = WEBUI_VERSION.removeprefix('v')
     server_version = ('HermesWebUI/' + _ver_suffix) if _ver_suffix != 'unknown' else 'HermesWebUI'
+    _CSP_REPORT_ONLY = (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "media-src 'self' data: blob:; "
+        "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; "
+        "report-uri /api/csp-report; report-to csp-endpoint"
+    )
+    _CSP_REPORT_TO = '{"group":"csp-endpoint","max_age":10886400,"endpoints":[{"url":"/api/csp-report"}]}'
+
+    @classmethod
+    def csp_report_only_policy(cls) -> str:
+        return cls._CSP_REPORT_ONLY
+
+    def end_headers(self) -> None:
+        self.send_header("Content-Security-Policy-Report-Only", self.csp_report_only_policy())
+        self.send_header("Report-To", self._CSP_REPORT_TO)
+        super().end_headers()
+
     def log_message(self, fmt, *args): pass  # suppress default Apache-style log
 
     def log_request(self, code: str='-', size: str='-') -> None:
@@ -115,8 +239,8 @@ class Handler(BaseHTTPRequestHandler):
         duration_ms = round((time.time() - getattr(self, '_req_t0', time.time())) * 1000, 1)
         record = _json.dumps({
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'method': self.command or '-',
-            'path': self.path or '-',
+            'method': getattr(self, 'command', None) or '-',
+            'path': getattr(self, 'path', None) or '-',
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         })
@@ -134,6 +258,11 @@ class Handler(BaseHTTPRequestHandler):
             result = handle_get(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The browser/client closed the socket while we were writing the
+            # response. This is expected for probes, tab closes, and SSE
+            # reconnect races; do not convert it into a misleading server 500.
+            return
         except Exception as e:
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
             return j(self, {'error': 'Internal server error'}, status=500)
@@ -148,10 +277,23 @@ class Handler(BaseHTTPRequestHandler):
             set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
-            if not check_auth(self, parsed): return
+            # Stage-346 Opus SHOULD-FIX defense-in-depth: scope the CSP-report
+            # auth carve-out to POST only. The endpoint is intentionally
+            # unauthenticated (browsers omit cookies on CSP reports), but the
+            # carve-out should not extend to PATCH/DELETE on that path even
+            # though they currently fail through CSRF/routing fallthrough.
+            _is_csp_report_post = (
+                parsed.path == "/api/csp-report" and self.command == "POST"
+            )
+            if not _is_csp_report_post and not check_auth(self, parsed): return
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The browser/client closed the socket while we were writing the
+            # response. This is expected for probes, tab closes, and SSE
+            # reconnect races; do not convert it into a misleading server 500.
+            return
         except Exception as e:
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
             return j(self, {'error': 'Internal server error'}, status=500)
@@ -161,8 +303,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._handle_write(handle_post)
 
+    def do_PUT(self) -> None:
+        self._handle_write(handle_put)
+
     def do_PATCH(self) -> None:
         self._handle_write(handle_patch)
+
+    def do_OPTIONS(self) -> None:
+        """Handle CORS preflight requests."""
+        self._req_t0 = time.time()
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def do_DELETE(self) -> None:
         self._handle_write(handle_delete)
@@ -220,8 +374,13 @@ def main() -> None:
     # its .bak (the data-loss shape #1558 produced), restore from the .bak.
     # Safe to run unconditionally — a clean install is a no-op.
     try:
+        from api.models import _active_state_db_path
         from api.session_recovery import recover_all_sessions_on_startup
-        result = recover_all_sessions_on_startup(SESSION_DIR)
+        result = recover_all_sessions_on_startup(
+            SESSION_DIR,
+            rebuild_index=True,
+            state_db_path=_active_state_db_path(),
+        )
         if result.get("restored"):
             print(f"[recovery] Restored {result['restored']}/{result['scanned']} sessions from .bak (see #1558).", flush=True)
     except Exception as exc:
@@ -311,6 +470,12 @@ def main() -> None:
             stop_watcher()
         except Exception:
             logger.debug("Failed to stop gateway watcher during shutdown")
+        # Drain pending memory-provider lifecycle commits before exit
+        try:
+            from api.session_lifecycle import drain_all_on_shutdown
+            drain_all_on_shutdown()
+        except Exception:
+            logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
 
 if __name__ == '__main__':
     main()

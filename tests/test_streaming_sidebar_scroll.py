@@ -38,10 +38,14 @@ def test_scroll_if_pinned_skips_during_recent_non_message_scroll():
     fn = _extract_fn(UI_JS, "scrollIfPinned")
     assert "_recentNonMessageScrollIntent()" in fn
     guard_index = fn.find("_recentNonMessageScrollIntent()")
-    write_index = fn.find("scrollTop=el.scrollHeight")
-    assert guard_index >= 0 and write_index >= 0 and guard_index < write_index
+    settle_index = fn.find("_settleMessageScrollToBottom(false)")
+    assert guard_index >= 0 and settle_index >= 0 and guard_index < settle_index
+
+    settle = _extract_fn(UI_JS, "_settleMessageScrollToBottom")
+    assert "_setMessageScrollToBottom();" in settle
+    assert "_recentNonMessageScrollIntent()" in settle
 
 
 def test_session_list_has_its_own_scroll_boundary():
     """The session list is its own scroll surface, not chained to the chat/body scroller."""
-    assert ".session-list{flex:1;overflow-y:auto;padding:0 8px 8px;min-height:0;overscroll-behavior-y:contain;touch-action:pan-y;}" in STYLE_CSS
+    assert ".session-list{flex:1;overflow-y:auto;padding:0 8px 8px;min-height:0;overscroll-behavior-y:contain;touch-action:pan-y;overflow-anchor:none;}" in STYLE_CSS

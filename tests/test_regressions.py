@@ -7,6 +7,7 @@ Each test is tagged with the sprint/commit where the bug was found and fixed.
 import json
 import os
 import pathlib
+import re
 import time
 import urllib.error
 import urllib.request
@@ -335,6 +336,19 @@ def test_server_delete_invalidates_index(cleanup_test_sessions):
             return
     assert False, "session/delete handler not found in server.py or api/routes.py"
 
+
+def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
+    """session/delete must remove sidecar backups so deleted sessions stay deleted."""
+    routes_src = (REPO_ROOT / "api" / "routes.py").read_text()
+    delete_idx = max(
+        routes_src.find("if parsed.path == '/api/session/delete':"),
+        routes_src.find('if parsed.path == "/api/session/delete":'),
+    )
+    assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
+    delete_block = routes_src[delete_idx:delete_idx+1400]
+    assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
+        "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
+
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 
 def test_token_handler_guards_session_id(cleanup_test_sessions):
@@ -420,7 +434,7 @@ def test_loadSession_inflight_restores_live_tool_cards(cleanup_test_sessions):
     # INFLIGHT branch must call appendLiveToolCard
     inflight_idx = src.find("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
-    inflight_block = src[inflight_idx:inflight_idx+900]
+    inflight_block = src[inflight_idx:inflight_idx+1600]
     assert "appendLiveToolCard" in inflight_block,         "loadSession INFLIGHT branch must restore live tool cards via appendLiveToolCard"
     assert "clearLiveToolCards" in inflight_block,         "loadSession INFLIGHT branch must clear old live cards before restoring"
 
@@ -569,10 +583,23 @@ def test_live_stream_tokens_persist_partial_assistant_for_session_switch(cleanup
         "messages.js must mark the persisted in-flight assistant row so renderMessages can re-anchor it"
     assert "syncInflightAssistantMessage();" in messages_src, \
         "token handler must update INFLIGHT state before checking the active session"
+    token_match = re.search(r"source\.addEventListener\('token',e=>\{(.*?)\n\s*\}\);", messages_src, re.S)
+    assert token_match, "token listener not found"
+    token_fn = token_match.group(1)
+    assert token_fn.find("assistantText+=d.text") < token_fn.find("if(!S.session||S.session.session_id!==activeSid) return;"), (
+        "token events must update the active stream's local state before DOM-only active-session guards"
+    )
+    assert token_fn.find("syncInflightAssistantMessage();") < token_fn.find("if(!S.session||S.session.session_id!==activeSid) return;"), (
+        "token events must persist INFLIGHT state even while another session is selected"
+    )
     assert "assistantRow&&!assistantRow.isConnected" in messages_src, \
         "live stream must drop stale detached assistant DOM references after session switches"
     assert "data-live-assistant" in ui_src, \
         "renderMessages must preserve a live-assistant DOM anchor when rebuilding the thread"
+    assert "snapshotLiveTurnHtmlForSession(activeSid)" in messages_src, \
+        "live turn DOM snapshots should preserve the interleaved timeline across session switches"
+    assert "restoreLiveTurnHtmlForSession(sid)" in (REPO_ROOT / "static/sessions.js").read_text(), \
+        "loadSession should restore the live turn snapshot before replaying flat tool cards"
 
 
 def test_inflight_session_state_tracks_live_tool_cards_per_session(cleanup_test_sessions):
@@ -597,13 +624,47 @@ def test_loadSession_inflight_sets_busy_before_renderMessages(cleanup_test_sessi
     src = (REPO_ROOT / "static/sessions.js").read_text(encoding='utf-8')
     inflight_idx = src.find("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
-    inflight_block = src[inflight_idx:inflight_idx+700]
+    inflight_block = src[inflight_idx:inflight_idx+1600]
     busy_pos = inflight_block.find("S.busy=true;")
-    render_pos = inflight_block.find("renderMessages();appendThinking();")
+    render_pos = inflight_block.find("renderMessages();")
     assert busy_pos >= 0, "loadSession INFLIGHT branch must set S.busy=true"
     assert render_pos >= 0, "loadSession INFLIGHT branch must call renderMessages()"
     assert busy_pos < render_pos, \
         "loadSession must set S.busy=true before renderMessages() to avoid duplicate tool cards"
+
+
+def test_loadSession_inflight_merges_tail_with_persisted_transcript(cleanup_test_sessions):
+    src = (REPO_ROOT / "static/sessions.js").read_text()
+    inflight_idx = src.find("if(INFLIGHT[sid]){")
+    assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
+    inflight_block = src[inflight_idx:inflight_idx+1200]
+
+    assert "await _ensureMessagesLoaded(sid);" in inflight_block, (
+        "returning to an active stream should load the persisted transcript before adding the live tail"
+    )
+    assert "_mergeInflightTailMessages(S.messages,inflightMessages)" in inflight_block, (
+        "INFLIGHT messages should be merged as a tail, not replace the full transcript"
+    )
+    assert "function _mergeInflightTailMessages" in src, (
+        "sessions.js should centralize INFLIGHT tail merge logic for regression coverage"
+    )
+
+
+def test_inflight_merge_dedupes_uploaded_user_message(cleanup_test_sessions):
+    """Uploaded-file turns render optimistically before the server stores the
+    final pending text with an `[Attached files: ...]` suffix.  The INFLIGHT
+    merge must treat those as the same user turn instead of rendering both.
+    """
+    src = (REPO_ROOT / "static/sessions.js").read_text()
+    assert "function _stripAttachedFilesMarker" in src, (
+        "sessions.js must normalize the server-side attached-files suffix before deduping user turns"
+    )
+    assert "_stripAttachedFilesMarker(aText)===_stripAttachedFilesMarker(bText)" in src, (
+        "INFLIGHT user-message comparison should dedupe optimistic upload text against final pending text"
+    )
+    assert "role==='user'" in src, (
+        "attached-files normalization should be limited to user turns"
+    )
 
 
 def test_loadSession_inflight_sets_active_stream_before_replaying_live_tool_cards(cleanup_test_sessions):
@@ -617,7 +678,7 @@ def test_loadSession_inflight_sets_active_stream_before_replaying_live_tool_card
     src = (REPO_ROOT / "static/sessions.js").read_text(encoding='utf-8')
     inflight_idx = src.find("if(INFLIGHT[sid]){")
     assert inflight_idx >= 0, "INFLIGHT branch not found in loadSession"
-    inflight_block = src[inflight_idx:inflight_idx+1000]
+    inflight_block = src[inflight_idx:inflight_idx+1600]
     active_pos = inflight_block.find("S.activeStreamId=activeStreamId;")
     replay_pos = inflight_block.find("appendLiveToolCard(tc);")
     attach_pos = inflight_block.find("attachLiveStream(sid, activeStreamId")
@@ -693,6 +754,23 @@ def test_messages_js_supports_live_reasoning_and_tool_completion(cleanup_test_se
         "messages.js must parse live stream state into reasoning + visible answer"
 
 
+def test_messages_js_supports_interim_assistant_events(cleanup_test_sessions):
+    """R18b: messages.js must render live interim assistant commentary when
+    `interim_assistant` SSE events arrive.
+
+    AIAgent emits completed mid-turn commentary through an interim callback.
+    Without a dedicated SSE handler, Codex-style interim status text disappears
+    from the live answer and users only see the final response after tool calls.
+    """
+    src = (REPO_ROOT / "static/messages.js").read_text()
+    assert "source.addEventListener('interim_assistant'" in src or 'source.addEventListener("interim_assistant"' in src, \
+        "messages.js must listen for interim_assistant SSE events"
+    assert "function _resetAssistantSegment()" in src, \
+        "messages.js should share live-segment reset logic between interim assistant updates and tool events"
+    assert "_resetAssistantSegment();" in src, \
+        "messages.js should apply segment reset when tool or interim assistant events require it"
+
+
 def test_ui_js_can_upgrade_thinking_spinner_into_live_reasoning_card(cleanup_test_sessions):
     """R19: ui.js must be able to replace the placeholder thinking spinner with
     streamed reasoning text while a turn is in progress.
@@ -733,14 +811,14 @@ def test_ui_js_keeps_reasoning_only_assistant_messages_visible(cleanup_test_sess
 
 def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_sessions):
     """R19c2/R19c3: reasoning-only messages must remain visible through the
-    shared collapsed activity dropdown, even when the anchor segment has no prose.
+    shared compact timeline activity UI, even when the anchor segment has no prose.
     """
     src = (REPO_ROOT / "static" / "ui.js").read_text(encoding='utf-8')
     compact = src.replace(' ', '').replace('\n', '')
     assert "assistantThinking.set(rawIdx,thinkingText)" in compact, \
         "renderMessages must preserve reasoning text before hiding empty anchor segments"
-    assert "_thinkingActivityNode(thinkingText)" in src, \
-        "thinking-only assistant content should render inside the shared activity dropdown"
+    assert "_thinkingActivityNode(thinkingText, false)" in src, \
+        "thinking-only assistant content should render as a collapsed timeline Thinking card"
 
 
 def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_test_sessions):
